@@ -77,14 +77,14 @@ def get_fq(some_id, read = 12):
 
 rule all:
     input:
-        #expand("{dir}/fastqc_{individual_id}", zip, dir = [sequence_mt["path"].loc[individual_id] for individual_id in SAMPLES], individual_id = SAMPLES),
-        #config["data_dir"] + "/multiqc_report_2025.html",
-        #f"{ref_base}.fna.fai",
-        #expand(f"{results_dir}/alignment/{ref_name}/{{individual_id}}.bam", individual_id = SAMPLES),
-        #expand(f"{results_dir}/alignment/{ref_name}/{{individual_id}}.bam.flagstat", individual_id = SAMPLES),
-        #expand(f"{results_dir}/alignment/{ref_name}/CRAMS/{{individual_id}}.cram", individual_id = SAMPLES),
+        expand("{dir}/fastqc_{individual_id}", zip, dir = [sequence_mt["path"].loc[individual_id] for individual_id in SAMPLES], individual_id = SAMPLES),
+        config["data_dir"] + "/multiqc_report_2025.html",
+        f"{ref_base}.fna.fai",
+        expand(f"{results_dir}/alignment/{ref_name}/{{individual_id}}.bam", individual_id = SAMPLES),
+        expand(f"{results_dir}/alignment/{ref_name}/{{individual_id}}.bam.flagstat", individual_id = SAMPLES),
+        expand(f"{results_dir}/alignment/{ref_name}/CRAMS/{{individual_id}}.cram", individual_id = SAMPLES),
         expand(f"{results_dir}/alignment/{ref_name}/{{individual_id}}.bam", individual_id = SAMPLES)
-        #f"{results_dir}/alignment/{ref_name}" + "/multiqc_flagstat_2025.html"
+        f"{results_dir}/alignment/{ref_name}" + "/multiqc_flagstat_2025.html"
 
 
 #===== change names fastq =====
