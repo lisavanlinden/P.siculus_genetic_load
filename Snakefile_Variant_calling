@@ -1,0 +1,801 @@
+shell.prefix("source /data/antwerpen/grp/asvardal/share/hscon5_setup.sh; ")
+
+#===================================
+##### Variant Calling Pipeline #####
+#===================================
+
+# import libraries
+
+import subprocess
+from scipy import stats
+import pandas as pd
+import os, yaml
+os.environ['OPENBLAS_NUM_THREADS'] = '1'
+import numpy as np
+import pysam
+from matplotlib import pyplot as plt
+jn = os.path.join
+
+TEST = False 
+N_TEST_CHUNKS = 2
+START = int(1e6)
+END = int(1e6 + 1e5)
+
+# config file
+
+configfile: "config.yaml"
+data_dir = config['data_dir'] # data directory
+results_dir = config['results_dir']  #results directory
+mt_dir = config['mt_dir']
+ref_name = config['ref']['name']
+ref_base = config['ref']['base_fn']
+ref_ext = config['ref']['ext_fa']
+ref_fai = config['ref']['ext_fai']
+ref_fna = config['ref']['base_fn'] + '.fna'
+ref_indexes = ['.amb', '.ann', '.bwt', '.pac','.sa','.fai']
+
+# wildcard constraints
+
+wildcard_constraints: #this is important, because otherwise the wildcards in the rules are ambiguous
+    i="\d+",
+    contig="\d+",
+    chrom= "\w+\.1", #"\w+", #chrom="(\w+|all_chrom)"
+    ref_fn=".*.fa",
+    #sequence_id="\w+",
+    ind_filter_id="[^.]+",
+    site_filter_id="[^.]+",
+    family_id="\w+",
+    filter_id="[^.]+",#"^/(?!raw|all_sites)([^.]+)$"
+    chunk="\d+",
+    vcf_type="(pass\.snps\.biallelic|pass\.indels\.biallelic|variants)",
+    vcf_extension="(vcf|vcf\.gz|bcf)",
+    regenotype="(whatshap_regenotype|no_regenotype)",
+    alignment_file=".*(sam|cram|bam)"
+            #"[^.]+"
+
+# metadata
+
+sequence_mt = pd.read_csv(config["sample_mt"], dtype=str, sep='\t').fillna('').set_index("individual_id", drop=False) # reads metadata file specified in config, sets index as individual_id
+SAMPLES = sequence_mt.index.values
+n_samples = len(SAMPLES)
+
+# chromosome names
+
+chrom_names = pd.read_csv(config["chrom_names"], dtype=str, sep='\t', index_col=0).fillna('')
+chrom_names_nucl = pd.read_csv(config["chrom_names_nucl"], dtype=str, sep='\t', index_col=0).fillna('')
+
+# filtering definitions 
+
+callset_id = config['callset_id']
+ind_filter_id = 'no_if1' #'tif1'
+site_filter_id = 'sf_stringent1'
+
+# type of vcf
+
+vcf_type = 'pass.snps.biallelic'
+
+# chromosome/chunck lengths
+
+chunk_size = 5e4 # define chunk size here 
+
+chrom_length = pd.read_csv(config['ref']['base_fn'] + config['ref']['ext_fai'],
+                           sep='\t', usecols=[0,1], names=['chrom','len'], index_col=0)
+chrom_length = chrom_length.squeeze()
+
+max_chrom_length = chrom_length.max()
+chunk_to_region = {i:(int(i*chunk_size+1), int((i+1)*chunk_size)) for i in range(int(np.ceil(max_chrom_length/chunk_size)))}
+
+# define chromosomes 
+
+CHROMOSOMES = chrom_names.index.values 
+CHROMOSOMES_auto = chrom_names_nucl.index.values
+#CHROMOSOMES = ["OZ076857.1"] #use this to test on one chromosome
+
+# sequence id
+
+#sequence_id = sequence_mt.index.values
+    # use in case of multiple sequencing files for an individual?
+
+# def for bcf rule
+
+def get_bams(individual_id):
+    return f"{results_dir}/alignment/{ref_name}/{individual_id}.bam"
+
+def get_bams_mainl(individual_id):
+    return f"{results_dir}/alignment/{ref_name}/psiculus_mainland_croatia/{individual_id}.bam"
+
+
+# defs for rule get_mean_coverage:
+
+def get_total_dp_files(wildcards):
+    cov_files = []
+    for chrom in CHROMOSOMES:
+        fn = f"{results_dir}/variant_calling/{ref_name}/all/total_coverage.{chrom}.txt"
+        cov_files.append(fn)
+    return cov_files
+
+def write_dp(fn, samples, dps):
+    with open(fn,'w') as f:
+        for sample, dp in zip(samples, dps):
+            f.write(sample + '\t' + str(dp) + '\n')
+
+def read_dp(fn): #load mean depth dictionary
+    dp_dic = {}
+    with open(fn) as f:
+        for line in f.readlines():
+            sample, dp = line.strip().split()
+            dp_dic.update({sample: float(dp)})
+    return dp_dic
+
+def get_chunks(chrom):
+    chunks = range(int(np.ceil(chrom_length[chrom] / chunk_size)))
+    if TEST:
+        mid_chunk = len(chunks) // 2
+        chunks = [c for c in chunks][mid_chunk:mid_chunk + N_TEST_CHUNKS]
+    return  chunks
+    
+# for rule get_filter_stats
+
+bins = {'MQ': np.linspace(0,61,62),
+                'DP': None, # will be set based on mean_dp below
+                'MQ0F': np.linspace(0,1,101),
+                'MQSB': np.linspace(0,1,101),
+                'DD': np.linspace(0,10,401),
+                'ExcHetOrig': np.linspace(0,1,101),
+                'AB_Het': np.linspace(0,100,401),
+                'MF': None } # will be set based on sample_number below
+
+# for rule vcf_add_filters
+
+def get_filter_command(wildcards):
+    commands = []
+    filters = config['site_filter_sets']['sf_stringent1']['filters']
+    for i, (filter_name, fd) in enumerate(filters.items()):
+        assert fd['threshold_type'] == 'absolute', (
+            "At this point filter thresholds need to be absolute. Relative thresholds currently not supported.")
+        commands.append(
+            f"bcftools filter --soft-filter {filter_name} --mode + -O u --exclude '{fd['tag']} {fd['operator']} {fd['threshold']}' ")
+    #-O u: output-type uncompressed BCF
+    #--mode +: append (instead of overwrite (x)) filters
+    return (" | ".join(commands))
+
+#run with
+
+localrules: all, min_max_dp, get_mean_coverage, get_filter_stats, plot_individual_filter_stats, plot_site_filter_stats
+
+#===== rule all =====
+
+rule all:
+    input:
+         expand(f"{results_dir}/variant_calling/{ref_name}/all_sites.{{chrom}}.bcf", chrom = CHROMOSOMES),
+            expand(f"{results_dir}/variant_calling/{ref_name}/total_coverage.{{chrom}}.txt", chrom = CHROMOSOMES),
+            f"{results_dir}/variant_calling/{ref_name}/mean_coverage.txt",
+            f"{results_dir}/variant_calling/{ref_name}/low_coverage.{ind_filter_id}.txt",
+            f"{results_dir}/variant_calling/{ref_name}/excess_coverage.{ind_filter_id}.txt",
+            f"{results_dir}/variant_calling/{ref_name}/individual_filter_thresholds.{ind_filter_id}.yaml",
+            expand(f"{results_dir}/variant_calling/{ref_name}/all_sites.{ind_filter_id}.{{chrom}}.bcf", chrom = CHROMOSOMES), 
+            expand(f"{results_dir}/variant_calling/{ref_name}/filter_per_sample.{ind_filter_id}.{{chrom}}.tsv", chrom = CHROMOSOMES),
+            expand(f"{results_dir}/variant_calling/{ref_name}/total_per_sample.{ind_filter_id}.{{chrom}}.tsv", chrom = CHROMOSOMES),
+            expand(f"{results_dir}/variant_calling/{ref_name}/stat_hists.{ind_filter_id}.{{chrom}}.yaml", chrom = CHROMOSOMES),
+            expand(f"{results_dir}/variant_calling/{ref_name}/individual_dp_hists.{ind_filter_id}.{{chrom}}.yaml", chrom = CHROMOSOMES),
+            f"{results_dir}/variant_calling/{ref_name}/figures/individual_dp_hist.{ref_name}.{callset_id}.{ind_filter_id}.pdf",
+            f"{results_dir}/variant_calling/{ref_name}/figures/individual_dp_hist.{ref_name}.{callset_id}.{ind_filter_id}.svg",
+            f"{results_dir}/variant_calling/{ref_name}/figures/filter_per_sample.{ref_name}.{callset_id}.{ind_filter_id}.pdf",
+            f"{results_dir}/variant_calling/{ref_name}/figures/filter_per_sample.{ref_name}.{callset_id}.{ind_filter_id}.svg",
+            f"{results_dir}/variant_calling/{ref_name}/figures/stat_hists.{ref_name}.{callset_id}.{ind_filter_id}.{site_filter_id}.pdf",
+            f"{results_dir}/variant_calling/{ref_name}/figures/stat_hists.{ref_name}.{callset_id}.{ind_filter_id}.{site_filter_id}.svg",
+            expand(f"{results_dir}/variant_calling/{ref_name}/all_sites.{ind_filter_id}.{site_filter_id}.{{chrom}}.bcf", chrom = CHROMOSOMES),
+            expand(f"{results_dir}/variant_calling/{ref_name}/{ind_filter_id}.{site_filter_id}.{{chrom}}.filters.info", chrom = CHROMOSOMES),
+            expand(f"{results_dir}/variant_calling/{ref_name}/{ind_filter_id}.{site_filter_id}.variants.{{chrom}}.bcf", chrom = CHROMOSOMES),
+            expand(f"{results_dir}/variant_calling/{ref_name}/{ind_filter_id}.{site_filter_id}.{{chrom}}.filters.info.gz", chrom = CHROMOSOMES),
+            expand(f"{results_dir}/variant_calling/{ref_name}/{ind_filter_id}.{site_filter_id}.{{chrom}}.filters.bed.gz", chrom = CHROMOSOMES),
+            expand(f"{results_dir}/variant_calling/{ref_name}/{ind_filter_id}.{site_filter_id}.{{chrom}}.filters.info.gz.tbi", chrom = CHROMOSOMES),
+            expand(f"{results_dir}/variant_calling/{ref_name}/{ind_filter_id}.{site_filter_id}.{{chrom}}.filters.bed.gz.tbi", chrom = CHROMOSOMES),
+            expand(f"{results_dir}/variant_calling/{ref_name}/{ind_filter_id}.{site_filter_id}.{{chrom}}.accessible.bed.gz", chrom = CHROMOSOMES),
+            expand(f"{results_dir}/variant_calling/{ref_name}/{ind_filter_id}.{site_filter_id}/{ind_filter_id}.{site_filter_id}.pass.snps.biallelic.{{chrom}}.bcf", chrom = CHROMOSOMES),
+            expand(f"{results_dir}/variant_calling/{ref_name}/{ind_filter_id}.{site_filter_id}/{ind_filter_id}.{site_filter_id}.pass.snps.biallelic.{{chrom}}.bcf.tbi", chrom = CHROMOSOMES),
+            expand(f"{results_dir}/variant_calling/{ref_name}/{ind_filter_id}.{site_filter_id}/{ind_filter_id}.{site_filter_id}.pass.snps.biallelic.{{chrom}}.bcf.csi", chrom = CHROMOSOMES),
+             f"{results_dir}/variant_calling/{ref_name}/{ind_filter_id}.{site_filter_id}/{callset_id}.{ind_filter_id}.{site_filter_id}.{vcf_type}.all_chrom.vcf.gz",
+             f"{results_dir}/variant_calling/{ref_name}/{ind_filter_id}.{site_filter_id}/{callset_id}.{ind_filter_id}.{site_filter_id}.{vcf_type}.all_chrom.vcf.gz.tbi",
+             f"{results_dir}/variant_calling/{ref_name}/{ind_filter_id}.{site_filter_id}/{callset_id}.{ind_filter_id}.{site_filter_id}.{vcf_type}.all_chrom.vcf.gz.csi",
+            f"{results_dir}/variant_calling/{ref_name}/{ind_filter_id}.{site_filter_id}/{callset_id}.{ind_filter_id}.{site_filter_id}.{vcf_type}.autosomes.vcf.gz",
+            f"{results_dir}/variant_calling/{ref_name}/{ind_filter_id}.{site_filter_id}/{callset_id}.{ind_filter_id}.{site_filter_id}.{vcf_type}.autosomes.vcf.gz.tbi",
+            f"{results_dir}/variant_calling/{ref_name}/{ind_filter_id}.{site_filter_id}/{callset_id}.{ind_filter_id}.{site_filter_id}.{vcf_type}.autosomes.vcf.gz.csi",
+            
+      
+#===== variant calling all sites =====
+
+rule call_all_sites_vcf: # variant calling, per chromosome
+    input:
+        bams = [get_bams(individual_id) for individual_id in SAMPLES],
+        ref = f"{ref_base}.fna"
+    output:
+        bcf = f"{results_dir}/variant_calling/{ref_name}/all_sites.{{chrom}}.bcf",
+        tot_dp= f"{results_dir}/variant_calling/{ref_name}/total_coverage.{{chrom}}.txt"
+    threads: 24 #12 #1
+    resources:
+        mem_mb= 10000, #4000,#lambda wildcards, threads: threads*2,
+        walltime= 168
+    params:
+        regions = lambda wildcards: wildcards.chrom,
+        #regions = lambda wildcards: wildcards.chrom + (f":{START}-{END}" if TEST else "")
+        samples = f"{mt_dir}/samples_all2025.txt"
+    shell:
+        """
+        samtools quickcheck -v {input.bams}
+        bcftools mpileup -a FORMAT/AD,FORMAT/DP -d 3000 --threads {threads} -Ou \
+            --regions {params.regions} \
+            -f {input.ref} \
+            {input.bams} \
+        | bcftools call --threads {threads} -f GQ -m -Ou \
+        | bcftools +fill-tags --threads {threads} -Ob \
+         | tee {output.bcf}.tmp | bcftools query -f '[%DP\t]\n'  \
+         | awk '{{for(i=1; i<=NF;i++) dp_tot[i]+=$i}} END{{for(i=1; i<=NF;i++) {{printf dp_tot[i]"\\t"}}; printf "\\n"}}' \
+          > {output.tot_dp}; \
+        bcftools reheader -s {params.samples} {output.bcf}.tmp > {output.bcf}
+        bcftools index {output.bcf}
+        rm {output.bcf}.tmp
+        """
+
+#===== calculating filtering =====
+
+rule get_mean_coverage: # mean coverage per sample
+    input:
+        total_dps = get_total_dp_files
+    output:
+        cov = f"{results_dir}/variant_calling/{ref_name}/mean_coverage.txt"
+        #f"{ana_dir}/data/{ref_name}/{callset_id}/mean_coverage.txt"
+    run:
+        mean_dps = [0 for i in range(n_samples)]
+        for fn in input.total_dps:
+            with open(fn) as f:
+                for i, d in enumerate(f.readline().strip().split()):
+                    mean_dps[i] += float(d)
+        mean_dps = np.array(mean_dps) / (chrom_length.loc(axis=0)[CHROMOSOMES].sum() \ 
+                                         if not TEST else N_TEST_CHUNKS*chunk_size*len(CHROMOSOMES))
+        print(mean_dps,mean_dps[0])
+        dp_dic = {s:float(c) for s,c in zip(SAMPLES, mean_dps)}
+        yaml.dump(dp_dic, open(output.cov,'w'))
+
+rule min_max_dp: # calculate min/max depth statistics per sample (individual thresholds used in histograps ind_dp)
+    input:
+        cov = f"{results_dir}/variant_calling/{ref_name}/mean_coverage.txt"
+    output:
+        min_dp = f"{results_dir}/variant_calling/{ref_name}/low_coverage.{ind_filter_id}.txt",
+        max_dp = f"{results_dir}/variant_calling/{ref_name}/excess_coverage.{ind_filter_id}.txt",
+        individual_filter_thresholds = f"{results_dir}/variant_calling/{ref_name}/individual_filter_thresholds.{ind_filter_id}.yaml"
+    params:
+        filter_thresh =lambda wildcards: config['individual_filter_sets']['no_if1'],
+    run:
+        #mean_dp_dic = read_dp(input.cov)
+        with open(input.cov) as f:
+            mean_dp_dic = yaml.safe_load(f) 
+                # calculate dictionaries for min/max coverage per sample based on Poisson dist and pvals defined under params (in config)
+        min_dp = {}  
+        max_dp = {}
+        for sample,dp in mean_dp_dic.items(): 
+                # get the depth thresholds corresponding to <> ind_dp_to_missing_pval of low/excessice coverage
+            min_dp.update({sample:float(stats.poisson.ppf(params.filter_thresh['min_dp_to_missing_pval'], dp))})
+            max_dp.update({sample:float(stats.poisson.isf(params.filter_thresh['max_dp_to_missing_pval'], dp))})
+        #print(max_dp, type(max_dp['CopAnsF17350449']))
+        #raise
+        yaml.dump(min_dp,open(output.min_dp,'w'))
+        yaml.dump(max_dp,open(output.max_dp,'w'))
+
+        #write_dp(output.min_dp, mean_dp_dic.keys(), min_dp)
+        #write_dp(output.max_dp,mean_dp_dic.keys(), max_dp)
+
+        filter_thresholds = {s: {'allele_balance': params.filter_thresh['allele_balance'],
+                                 'low_depth': min_dp[s],
+                                 'high_depth': max_dp[s],
+                                 'low_gq': params.filter_thresh['low_gq']} for s in SAMPLES}
+        yaml.dump(filter_thresholds, open(output.individual_filter_thresholds,'w'))
+        
+rule get_filter_stats: # calculates filter stats and sets individual genotypes to missing according to thresholds defined in config; look at plots to see if thresholds are in the right places 
+    input:
+        bcf = f"{results_dir}/variant_calling/{ref_name}/all_sites.{{chrom}}.bcf",
+        cov = f"{results_dir}/variant_calling/{ref_name}/mean_coverage.txt",
+        min_dp = f"{results_dir}/variant_calling/{ref_name}/low_coverage.{ind_filter_id}.txt",
+        max_dp = f"{results_dir}/variant_calling/{ref_name}/excess_coverage.{ind_filter_id}.txt"
+    output:
+        bcf =  f"{results_dir}/variant_calling/{ref_name}/all_sites.{ind_filter_id}.{{chrom}}.bcf", #filtering and samples_all_sites
+        filter_per_sample  =  f"{results_dir}/variant_calling/{ref_name}/filter_per_sample.{ind_filter_id}.{{chrom}}.tsv",
+        total_per_sample =  f"{results_dir}/variant_calling/{ref_name}/total_per_sample.{ind_filter_id}.{{chrom}}.tsv",
+        stat_hists =  f"{results_dir}/variant_calling/{ref_name}/stat_hists.{ind_filter_id}.{{chrom}}.yaml",
+        individual_dp_hists =  f"{results_dir}/variant_calling/{ref_name}/individual_dp_hists.{ind_filter_id}.{{chrom}}.yaml"
+        #**{stat:f'{stat}_{{chrom}}.npy' for stat in bins.keys()},
+        #**{sample:f'dp_{sample}_{{chrom}}.npy' for sample in samples}
+    threads: 1 #5 #12 #1
+    resources:
+        mem_mb = 7000, #lambda wildcards, threads: threads*2,
+        walltime = 72 #might need to be higher for large samples
+    params:
+        filter_thresh = lambda wildcards: config['individual_filter_sets']['no_if1'],
+        flush_interval = 1e5,
+        #regions = lambda wildcards: ((wildcards.chrom, START, END) if TEST else [])
+        regions = lambda wildcards: (wildcards.chrom)
+
+    run:
+        def flush_data():
+            for stat, b in bins.items():
+                dt = np.array(temp_data[stat])
+                dt[dt > b[-1]] = b[-1]
+                dt[dt < b[0]] = b[0]
+                h, _ = np.histogram(dt,bins=b)
+                hists[stat] += h
+                temp_data[stat] = []
+            for sample, b in dp_per_sample_bins.items():
+                dt = np.array(dp_per_sample_tmp[sample])
+                dt[dt > b[-1]] = b[-1]
+                dt[dt < b[0]] = b[0]
+                h, _ = np.histogram(dt,bins=b)
+                dp_per_sample_hists[sample] += h
+                dp_per_sample_tmp[sample] = []
+
+
+        #input file stream
+        bcf_in = pysam.VariantFile(input.bcf)  # auto-detect input format
+        samples1 = [s for s in bcf_in.header.samples]
+        for i, (s0, s1) in enumerate(zip(SAMPLES, samples1)):
+            assert s0 == s1,  ("Sample at position {} in metadata and vcf are not the same."
+                                        "Metadata {} != VCF {}. That can lead to unexpected behaviour.".format(i,s0, s1))
+
+        n_samples1 = len(SAMPLES)
+        assert n_samples == n_samples1, "Number of samples in metadata ({}) and VCF ({}) not the same:".format(n_samples, n_samples1)
+        bins['MF'] = np.linspace(0, 1, n_samples + 1)
+
+        #this is an output stream to recalculate AN, AC etc after setting some GTs to ./. below
+        filltag_stream = subprocess.Popen(['bcftools +fill-tags --threads {threads} -Ob'],
+            stdin=subprocess.PIPE,
+            stdout=open(output.bcf, 'w'),
+            stderr=subprocess.PIPE,shell=True,
+            encoding='utf8')
+
+
+        #load mean depth dictionary
+        with open(input.cov) as f:
+            mean_dp_dic = yaml.safe_load(f)
+        total_dp = np.sum([v for v in mean_dp_dic.values()])
+        bins['DP'] = np.arange(0,4 * total_dp, 1)
+
+        #calculate dictionaries for min/max coverage
+        # per sample based on Poisson dist and pvals defined under params
+        with open(input.min_dp) as f:
+            min_dp_dic = yaml.safe_load(f)
+        with open(input.max_dp) as f:
+            max_dp_dic = yaml.safe_load(f)
+
+        #new info annotations calculated below added to vcf header
+        bcf_in.header.info.add('DD',1,'Float',
+            'Average across samples of deviation from individual mean coverage in units of standard deviation.')
+        bcf_in.header.info.add('ExcHetOrig','A','Float',
+            'Excess Heterozygosity before genotype filtering.')
+        bcf_in.header.info.add('AB_Het',1,'Float',
+            'Phred-scaled p-value of binomial test for allele balance violation in heterozygous genotypes. Larger is worse.')
+        bcf_in.header.info.add('MF',1,'Float',
+            'Fraction of missing (./.) genotypes after genotype filtering.')
+
+        #output object, note how this is piped into filltag_stream for recalcuating INFO tags
+        bcf_out = pysam.VariantFile(filltag_stream.stdin,'wu', header=bcf_in.header)
+
+        #filter stats
+        filter_per_sample = {s: {'allele_balance': 0,
+                                 'low_depth': 0,
+                                 'high_depth': 0,
+                                 'low_gq': 0} for s in SAMPLES}
+        total_per_sample = copy.deepcopy(filter_per_sample)
+
+
+
+
+        # the below defines objects to store individual depth values
+        # and calculate and sum histograms each flush interval
+        dp_per_sample_tmp = {s: [] for s in SAMPLES}
+        dp_per_sample_bins = {s: np.arange(0,5 * mean_dp_dic[s],1) for s in SAMPLES}
+        dp_per_sample_hists = {k: np.zeros(len(v) - 1) for k, v in dp_per_sample_bins.items()}
+
+        # the below defines objects to store INFO column statistics per line
+        # and calculate and sum histograms each flush interval
+
+        hists = {k: np.zeros(len(v) - 1) for k, v in bins.items()}
+        temp_data = {k: [] for k in bins.keys()}
+
+        print(SAMPLES)
+        for i, rec in enumerate(bcf_in.fetch(params.regions)):
+            deviations = []
+            ads_hets = np.array([0, 0])
+            missing = 0
+            for n, s in rec.samples.items():
+                dp = s['DP']
+                if (dp <= min_dp_dic[n]):
+                    s['GT'] = (None, None)
+                    filter_per_sample[n]['low_depth'] += 1
+                total_per_sample[n]['low_depth'] += 1
+
+                if (dp >= max_dp_dic[n]):
+                    s['GT'] = (None, None)
+                    filter_per_sample[n]['high_depth'] += 1
+                total_per_sample[n]['high_depth'] += 1
+
+                #test for het
+                if s['GT'][0] != s['GT'][1]:
+                    ad = np.array(s['AD'])[list(s['GT'])]
+                    ads_hets += ad
+                    total_reads = sum(ad) #ab_pval = stats.binomtest(ad[0], n = int(sum(ad))).pvalue #stats.binomtest(ad)
+                    
+                    if total_reads > 0:  # Ensure n is at least 1 before calling binomtest
+                        ab_pval = stats.binomtest(ad[0], n=int(total_reads)).pvalue
+                        
+                        if ab_pval <= params.filter_thresh['allele_balance']:
+                            s['GT'] = (None, None)
+                            filter_per_sample[n]['allele_balance'] += 1
+                
+                    total_per_sample[n]['allele_balance'] += 1
+
+                deviation = np.abs(s['DP'] - mean_dp_dic[n]) / np.sqrt(mean_dp_dic[n])
+                deviations.append(deviation)
+                try:
+                    if s['GQ'] < params.filter_thresh['low_gq']:
+                        s['GT'] = (None, None)
+                        filter_per_sample[n]['low_gq']+= 1
+                    total_per_sample[n]['low_gq'] += 1
+                except KeyError:
+                    pass
+
+                #add to individual depth list
+                dp_per_sample_tmp[n].append(s['DP'])
+                if s['GT'] == (None, None):
+                    missing += 1
+            missing_fraction = missing * 1. / n_samples
+            rec.info.update({'MF': missing_fraction})
+
+            #this calculated the mean across individuals of standardised DP deviation
+            #large value means that at this site many individuals have a coverage
+            #very different from their mean coverage
+            mean_deviation = np.mean(deviations)
+            rec.info.update({'DD': mean_deviation})
+
+            #if there are any hets, calculate Allele Balance across all samples
+            if np.any(ads_hets):
+                ab_pval = stats.binomtest(ads_hets[0], n = sum(ads_hets)).pvalue #stats.binomtest(ads_hets)
+                ab_phred = -10 * np.log10(ab_pval)
+                rec.info.update({'AB_Het': ab_phred})
+                rec.info.update({'ExcHetOrig': rec.info['ExcHet']})
+
+            for stat, l in temp_data.items():
+                try:
+                    st = rec.info[stat]
+
+                    if stat == 'ExcHetOrig':
+                        st = st[0]
+                    if st is not None:
+                        l.append(st)
+                except KeyError:
+                    pass
+
+            if not (i + 1) % params.flush_interval:
+                flush_data()
+            #write the line to the output stream
+            #print(rec)
+            bcf_out.write(rec)
+        #add stats to histogram for last interval
+        flush_data()
+
+        stat_dic = {}
+        for stat, h in hists.items():
+            b = bins[stat]
+            stat_dic.update({stat:
+                                 {'bins': [float(b0) for b0 in b],
+                                  'hists': [int(i) for i in h]}})
+        yaml.dump(stat_dic, open(output.stat_hists,'w'))
+
+        d = {}
+        for sample, h in dp_per_sample_hists.items():
+            b = dp_per_sample_bins[sample]
+            d.update({sample:
+                          {'bins': [float(b0) for b0 in b],
+                           'hists': [int(i) for i in h]}})
+        yaml.dump(d, open(output.individual_dp_hists,'w'))
+
+        filter_per_sample_df = pd.DataFrame(filter_per_sample)
+        filter_per_sample_df.index.name = 'statistic'
+        filter_per_sample_df.columns.name = 'sample'
+        filter_per_sample_df.to_csv(output.filter_per_sample,sep='\t')
+
+        total_per_sample_df = pd.DataFrame(total_per_sample)
+        total_per_sample_df.index.name = 'statistic'
+        total_per_sample_df.columns.name = 'sample'
+        total_per_sample_df.to_csv(output.total_per_sample, sep='\t')
+
+        bcf_out.close()
+        o,e = filltag_stream.communicate()
+        if o is not None:
+            print(o,file=sys.stdout)
+        if e is not None:
+            print(e, file=sys.stderr)
+
+rule plot_individual_filter_stats: # plots statistics of indiviudal genotypes set to ./. (filtering) and plots individual DP distributions
+    input:
+        filter_per_samples = [ expand(f"{results_dir}/variant_calling/{ref_name}/filter_per_sample.{ind_filter_id}.{{chrom}}.tsv", chrom = CHROMOSOMES) ],
+        total_per_samples = [ expand(f"{results_dir}/variant_calling/{ref_name}/total_per_sample.{ind_filter_id}.{{chrom}}.tsv", chrom = CHROMOSOMES) ],
+        individual_dp_hists = [ expand(f"{results_dir}/variant_calling/{ref_name}/individual_dp_hists.{ind_filter_id}.{{chrom}}.yaml", chrom = CHROMOSOMES) ],
+        min_dp = f"{results_dir}/variant_calling/{ref_name}/low_coverage.{ind_filter_id}.txt",
+        max_dp = f"{results_dir}/variant_calling/{ref_name}/excess_coverage.{ind_filter_id}.txt",
+        individual_filter_thresholds = f"{results_dir}/variant_calling/{ref_name}/individual_filter_thresholds.{ind_filter_id}.yaml"
+    output:
+        ind_dp_hist_pdf =  f"{results_dir}/variant_calling/{ref_name}/figures/individual_dp_hist.{ref_name}.{callset_id}.{ind_filter_id}.pdf",
+        ind_dp_hist_svg =  f"{results_dir}/variant_calling/{ref_name}/figures/individual_dp_hist.{ref_name}.{callset_id}.{ind_filter_id}.svg",
+        filter_per_sample_pdf =  f"{results_dir}/variant_calling/{ref_name}/figures/filter_per_sample.{ref_name}.{callset_id}.{ind_filter_id}.pdf",
+        filter_per_sample_svg = f"{results_dir}/variant_calling/{ref_name}/figures/filter_per_sample.{ref_name}.{callset_id}.{ind_filter_id}.svg"
+    #params:
+    #    filter_thresh = lambda wildcards: config['individual_filter_sets'][wildcards.ind_filter_id],
+    run: #Bar plots of how many genotypes per sample were set to missing because of each of the filters
+        filtered = pd.read_csv(input.filter_per_samples[0], sep='\t', index_col=0)
+        total = pd.read_csv(input.total_per_samples[0],sep='\t',index_col=0)
+
+        for fn1, fn2 in zip(input.filter_per_samples[1:], input.total_per_samples[1:]):
+            f = pd.read_csv(fn1, sep='\t', index_col=0)
+            t = pd.read_csv(fn2, sep='\t', index_col=0)
+            filtered += f
+            total += t
+        rel_filter = filtered / total
+
+        with open(input.individual_filter_thresholds) as f:
+            filter_thresholds = yaml.safe_load(f)
+
+        n_cols = 1
+        n_rows = int(np.ceil(len(filtered) / n_cols))
+        fig = plt.figure(figsize=(0.2 * n_samples, 4 * n_rows))
+        for i, (stat, f) in enumerate(rel_filter.iterrows()):
+
+            ax = fig.add_subplot(n_rows,n_cols,i + 1)
+
+            if stat in ['low_depth', 'high_depth']:
+                f.index = [s + " ({})".format(filter_thresholds[s][stat]) for s in f.index]
+                title = stat
+            else:
+                title = stat + " (threshold {})".format(filter_thresholds[SAMPLES[0]][stat])
+
+            f.plot(kind='bar',ax=ax,legend=False,label='Total')
+            ax.set_title(title)
+            ax.set_ylabel("Proportion filtered")
+        plt.tight_layout()
+
+        plt.savefig(output.filter_per_sample_pdf, bbox_inches='tight')
+        plt.savefig(output.filter_per_sample_svg, bbox_inches='tight')
+
+        #dictionaries for min/max coverage
+        # per sample based on Poisson dist and pvals defined under params
+
+        with open(input.min_dp) as f:
+            min_dp_dic = yaml.safe_load(f)
+        with open(input.max_dp) as f:
+            max_dp_dic = yaml.safe_load(f)
+        #min_dp_dic = read_dp(input.min_dp)
+        #max_dp_dic = read_dp(input.max_dp)
+
+
+        with open(input.individual_dp_hists[0]) as f:
+            sd = yaml.safe_load(f)
+            bins = {s:v['bins'] for s,v in sd.items()}
+            hists = {s:np.array(v['hists']).astype(int) for s,v in sd.items()}
+        for fn in input.individual_dp_hists[1:]:
+            with open(fn) as f:
+                sd = yaml.safe_load(f)
+                bins1 = {s: v['bins'] for s, v in sd.items()}
+                hists1 = {s: np.array(v['hists']).astype(int) for s, v in sd.items()}
+                assert bins1 == bins
+                for s,h in hists1.items():
+                    hists[s] += h
+        bins = {s:np.array(v) for s,v in bins.items()}
+
+        fig = plt.figure(figsize=(16,5*int(np.ceil(len(hists) / 3))))
+        for i,(sample, h) in enumerate(hists.items()):
+            #ax = fig.add_subplot(np.ceil(len(hists) / 3), 3, i+1)
+            ax = fig.add_subplot(int(np.ceil(len(hists) / 3)), 3, i+1)
+            #poss = bins[sample][:-1] + (bins[sample][1:] - bins[sample][:-1]) / 2
+            plt.bar(bins[sample][:-1], h, width=bins[sample][1:] - bins[sample][:-1], align='edge')
+            mn = min_dp_dic[sample]
+            mx = max_dp_dic[sample]
+            plt.axvspan(bins[sample][0], mn, color='r', alpha=0.2)
+            plt.axvspan(mx, bins[sample][-1], color='r', alpha=0.2)
+            ax.set_xlabel(sample)
+        plt.savefig(output.ind_dp_hist_pdf, bbox_inches='tight')
+        plt.savefig(output.ind_dp_hist_svg, bbox_inches='tight')
+
+
+
+rule plot_site_filter_stats: # Plots filter statistic distributions with site filter threshold and creates a dynamic site filters to translate relative filters into absolute values. 
+    input:
+        stat_hists = expand(f"{results_dir}/variant_calling/{ref_name}/stat_hists.{ind_filter_id}.{{chrom}}.yaml", chrom = CHROMOSOMES)
+    output:
+        #dynamic_filter_config = f'{ana_dir}/_data/{{ref_name}}/{{callset_id}}/stat_hists.{{ind_filter_id}}.{{site_filter_id}}.yaml',
+        stat_hist_pdf =  f"{results_dir}/variant_calling/{ref_name}/figures/stat_hists.{ref_name}.{callset_id}.{ind_filter_id}.{site_filter_id}.pdf",
+        stat_hist_svg =  f"{results_dir}/variant_calling/{ref_name}/figures/stat_hists.{ref_name}.{callset_id}.{ind_filter_id}.{site_filter_id}.svg"
+    params:
+        filters = lambda wildcards: config['site_filter_sets']['sf_stringent1']['filters'],
+    run:
+        ##
+        with open(input.stat_hists[0]) as f:
+            sd = yaml.safe_load(f)
+            bins = {s:v['bins'] for s,v in sd.items()}
+            hists = {s:np.array(v['hists']).astype(int) for s,v in sd.items()}
+        for fn in input.stat_hists[1:]:
+            with open(fn) as f:
+                sd = yaml.safe_load(f)
+                bins1 = {s: v['bins'] for s, v in sd.items()}
+                hists1 = {s: np.array(v['hists']).astype(int) for s, v in sd.items()}
+                assert bins1 == bins
+                for s,h in hists1.items():
+                    hists[s] += h
+
+        bins = {s:np.array(v) for s,v in bins.items()}
+        n_rows = int(np.ceil(len(params.filters) / 2))
+        fig = plt.figure(figsize=(16,5*n_rows))
+
+        for i, (filter_name, fdic) in enumerate(params.filters.items()):
+            ax = fig.add_subplot(n_rows, 2, i+1)
+            k = fdic['tag']
+            try:
+                h = hists[k]
+            except KeyError as e:
+                print("No tag data recorded for filter in config {filter_name} with tag {k}."
+                      "You need add this to the bin dict in rule get_filter_stats.")
+            plt.bar(bins[k][:-1],h, width=bins[k][1:] - bins[k][:-1], align='edge')
+
+            assert fdic['threshold_type'] == 'absolute', 'relative threshold not yet implemented'
+            if fdic['operator'] == '>':
+                mn1 = fdic['threshold']
+                mx1 = bins[k][-1]
+                #pct_filtered = 100 * (ss > threshold).mean()
+            elif fdic['operator'] == '<':
+                mn1 = bins[k][0]
+                mx1 = fdic['threshold']
+                #pct_filtered = 100 * (ss < threshold).mean()
+            else:
+                raise ValueError("Only < and > operators implemented for filters.")
+            plt.axvspan(mn1, mx1, color='r', alpha=0.2)
+            ax.set_xlabel(k)
+            ax.set_title(filter_name)
+        plt.savefig(output.stat_hist_pdf, bbox_inches='tight')
+        plt.savefig(output.stat_hist_svg, bbox_inches='tight')
+
+
+#===== apply filtering =====
+
+rule vcf_add_filters:
+    input:
+        vcf = f"{results_dir}/variant_calling/{ref_name}/all_sites.{ind_filter_id}.{{chrom}}.bcf"
+    output:
+        vcf = f"{results_dir}/variant_calling/{ref_name}/all_sites.{ind_filter_id}.{site_filter_id}.{{chrom}}.bcf",
+    #group: 'filter_batch'
+    params:
+        filter_command = get_filter_command
+    shell:
+        """
+        bcftools view --threads 12 -O u {input.vcf} | \
+        {params.filter_command} | \
+        bcftools view --threads 12 -O b > {output.vcf}
+        """
+
+rule get_filter_info:
+    input:
+        vcf = f"{results_dir}/variant_calling/{ref_name}/all_sites.{ind_filter_id}.{site_filter_id}.{{chrom}}.bcf"
+    output:
+        filter_info = f"{results_dir}/variant_calling/{ref_name}/{ind_filter_id}.{site_filter_id}.{{chrom}}.filters.info",
+    #group: 'filter_batch'
+    shell:
+        """
+        bcftools query --include 'FILTER != "PASS"' --format '%CHROM\\t%POS\\t%POS\\t%FILTER\\n' {input.vcf}  | awk 'BEGIN{{OFS="\t"}} {{print $1,$2,$4}}' > {output.filter_info}  
+        """
+
+rule get_variant_bcf:
+    input:
+        bcfs = lambda wildcards: f"{results_dir}/variant_calling/{ref_name}/all_sites.{ind_filter_id}.{site_filter_id}.{{chrom}}.bcf"
+    output:
+        bcf = f"{results_dir}/variant_calling/{ref_name}/{ind_filter_id}.{site_filter_id}.variants.{{chrom}}.bcf"
+    shell:
+        """
+        bcftools view --threads 12 -Ob --exclude 'ALT = "."' {input.bcfs}  > {output.bcf};
+        bcftools index --threads 12 -f {output.bcf}
+        """
+
+rule merge_chrom_filter_files:
+    input:
+        filter_infos = lambda wildcards: f"{results_dir}/variant_calling/{ref_name}/{ind_filter_id}.{site_filter_id}.{{chrom}}.filters.info"
+    output:
+        filter_info = f"{results_dir}/variant_calling/{ref_name}/{ind_filter_id}.{site_filter_id}.{{chrom}}.filters.info.gz",
+        filter_bed = f"{results_dir}/variant_calling/{ref_name}/{ind_filter_id}.{site_filter_id}.{{chrom}}.filters.bed.gz",
+        filter_info_ix = f"{results_dir}/variant_calling/{ref_name}/{ind_filter_id}.{site_filter_id}.{{chrom}}.filters.info.gz.tbi",
+        filter_bed_ix = f"{results_dir}/variant_calling/{ref_name}/{ind_filter_id}.{site_filter_id}.{{chrom}}.filters.bed.gz.tbi"
+    params:
+        merge_dist=lambda wildcards: config['site_filter_sets']['sf_stringent1']["merge_dist"]
+    shell:
+        """
+        cat {input.filter_infos} | tee >(bgzip -c > {output.filter_info}) \
+        | awk  'BEGIN{{OFS="\\t"}} {{print $1,$2-1,$2}}' \
+        | bedtools merge -d {params.merge_dist} | bgzip -c  >  {output.filter_bed}; 
+         tabix -s 1 -b 2 {output.filter_info}; 
+         tabix -p bed {output.filter_bed}; 
+        """
+
+rule get_accessible_bed:
+    input:
+        filter_bed=  f"{results_dir}/variant_calling/{ref_name}/{ind_filter_id}.{site_filter_id}.{{chrom}}.filters.bed.gz",
+    output:
+        accessible_bed = f"{results_dir}/variant_calling/{ref_name}/{ind_filter_id}.{site_filter_id}.{{chrom}}.accessible.bed.gz",
+    params:
+        chrom_len = lambda wildcards: chrom_length.loc[wildcards.chrom],
+        data_dir = lambda wildcards, output: os.path.dirname(output.accessible_bed)
+    shell:
+        """
+        echo "{wildcards.chrom}\t0\t{params.chrom_len}" > {params.data_dir}/{wildcards.chrom}.bed
+        bedtools subtract -a {params.data_dir}/{wildcards.chrom}.bed -b  <(gzip -dc {input.filter_bed}) | bgzip -c > {output.accessible_bed}
+        """
+        
+rule select_biallelic_pass_snps:
+    input:
+        bcf = f"{results_dir}/variant_calling/{ref_name}/{ind_filter_id}.{site_filter_id}.variants.{{chrom}}.bcf",
+        accessible_bed = f"{results_dir}/variant_calling/{ref_name}/{ind_filter_id}.{site_filter_id}.{{chrom}}.accessible.bed.gz"
+    output:
+        vcf = f"{results_dir}/variant_calling/{ref_name}/{ind_filter_id}.{site_filter_id}/{ind_filter_id}.{site_filter_id}.pass.snps.biallelic.{{chrom}}.bcf",
+        index1 = f"{results_dir}/variant_calling/{ref_name}/{ind_filter_id}.{site_filter_id}/{ind_filter_id}.{site_filter_id}.pass.snps.biallelic.{{chrom}}.bcf.tbi",
+        index2 = f"{results_dir}/variant_calling/{ref_name}/{ind_filter_id}.{site_filter_id}/{ind_filter_id}.{site_filter_id}.pass.snps.biallelic.{{chrom}}.bcf.csi"
+    resources:
+        mem_mb = 7000, #lambda wildcards, threads: threads*2,
+        walltime = 72 #72 #might need to be higher for large samples
+    shell:
+        """
+        bcftools view --threads 12 \
+            -Oz \
+            --max-alleles 2 \
+            --types snps \
+            --regions-file {input.accessible_bed}\
+            {input.bcf} > {output.vcf};
+         bcftools index -f {output.vcf};
+         bcftools index --tbi -f {output.vcf}
+         """
+
+
+rule merge_chrom_vcfs:
+    input:
+        vcfs = expand(f"{results_dir}/variant_calling/{ref_name}/{ind_filter_id}.{site_filter_id}/{ind_filter_id}.{site_filter_id}.pass.snps.biallelic.{{chrom}}.bcf", chrom = CHROMOSOMES)
+    output:
+        vcf = f"{results_dir}/variant_calling/{ref_name}/{ind_filter_id}.{site_filter_id}/{callset_id}.{ind_filter_id}.{site_filter_id}.{vcf_type}.all_chrom.vcf.gz",
+        index1 = f"{results_dir}/variant_calling/{ref_name}/{ind_filter_id}.{site_filter_id}/{callset_id}.{ind_filter_id}.{site_filter_id}.{vcf_type}.all_chrom.vcf.gz.tbi",
+        index2 = f"{results_dir}/variant_calling/{ref_name}/{ind_filter_id}.{site_filter_id}/{callset_id}.{ind_filter_id}.{site_filter_id}.{vcf_type}.all_chrom.vcf.gz.csi"
+    resources:
+        mem_mb = 7000, #lambda wildcards, threads: threads*2,
+        walltime = 168 #72 #might need to be higher for large samples
+    shell:
+        """
+        bcftools concat -Oz {input.vcfs} > {output.vcf};
+        bcftools index -f {output.vcf};
+        bcftools index --tbi -f {output.vcf}
+        """
+
+rule merge_chrom_vcfs_nosex:
+    input:
+        vcfs = expand(f"{results_dir}/variant_calling/{ref_name}/{ind_filter_id}.{site_filter_id}/{ind_filter_id}.{site_filter_id}.pass.snps.biallelic.{{chrom}}.bcf", chrom = CHROMOSOMES_auto)
+    output:
+        vcf = f"{results_dir}/variant_calling/{ref_name}/{ind_filter_id}.{site_filter_id}/{callset_id}.{ind_filter_id}.{site_filter_id}.{vcf_type}.autosomes.vcf.gz",
+        index1 = f"{results_dir}/variant_calling/{ref_name}/{ind_filter_id}.{site_filter_id}/{callset_id}.{ind_filter_id}.{site_filter_id}.{vcf_type}.autosomes.vcf.gz.tbi",
+        index2 = f"{results_dir}/variant_calling/{ref_name}/{ind_filter_id}.{site_filter_id}/{callset_id}.{ind_filter_id}.{site_filter_id}.{vcf_type}.autosomes.vcf.gz.csi"
+    resources:
+        mem_mb = 7000, #lambda wildcards, threads: threads*2,
+        walltime = 72 #72 #might need to be higher for large samples
+    shell:
+        """
+        bcftools concat -Oz {input.vcfs} > {output.vcf};
+        bcftools index -f {output.vcf};
+        bcftools index --tbi -f {output.vcf}
+        """        
+
+
+
+
+
+
+
+
+
