@@ -1,0 +1,236 @@
+shell.prefix("source /data/antwerpen/grp/asvardal/share/hscon5_setup.sh; ")
+
+#=============================
+##### Alignment Pipeline #####
+#=============================
+
+# import libraries
+
+import subprocess
+from scipy import stats
+import pandas as pd
+import os, yaml
+os.environ['OPENBLAS_NUM_THREADS'] = '1'
+import numpy as np
+import pysam
+from matplotlib import pyplot as plt
+jn = os.path.join
+
+# config file
+
+configfile: "config.yaml"
+data_dir = config['data_dir'] # data directory
+results_dir = config['results_dir']  #results directory
+ref_name = config['ref']['name']
+ref_base = config['ref']['base_fn']
+ref_ext = config['ref']['ext_fa']
+ref_fai = config['ref']['ext_fai']
+ref_fna = config['ref']['base_fn'] + '.fna'
+ref_indexes = ['.amb', '.ann', '.bwt', '.pac','.sa','.fai']
+
+# wildcard constraints
+
+wildcard_constraints: #this is important, because otherwise the wildcards in the rules are ambiguous
+    i="\d+",
+    contig="\d+",
+    chrom= "\w+\.1", #"\w+", #chrom="(\w+|all_chrom)"
+    ref_fn=".*.fa",
+    #sequence_id="\w+",
+    ind_filter_id="[^.]+",
+    site_filter_id="[^.]+",
+    family_id="\w+",
+    filter_id="[^.]+",#"^/(?!raw|all_sites)([^.]+)$"
+    chunk="\d+",
+    vcf_type="(pass\.snps\.biallelic|pass\.indels\.biallelic|variants)",
+    vcf_extension="(vcf|vcf\.gz|bcf)",
+    regenotype="(whatshap_regenotype|no_regenotype)",
+    alignment_file=".*(sam|cram|bam)"
+            #"[^.]+"
+
+# metadata
+
+sequence_mt = pd.read_csv(config["sample_mt"], dtype=str, sep='\t').fillna('').set_index("individual_id", drop=False) 
+    # reads metadata file specified in config, sets index as individual_id
+
+SAMPLES = sequence_mt.index.values # make sure these are the right samples!
+n_samples = len(SAMPLES)
+
+# chromosome names
+
+chrom_names = pd.read_csv(config["chrom_names"], dtype=str, sep='\t', index_col=0).fillna('')
+#chrom_names_nucl = pd.read_csv(config["chrom_names_nucl"], dtype=str, sep='\t', index_col=0).fillna('')
+
+# def for fastq rule
+
+def get_fq(some_id, read = 12):
+    fq = "{dir}/{reads}".format(dir = sequence_mt["path"].loc[some_id], reads = sequence_mt["read_files"].loc[some_id])
+    fq1 = fq.format("1")
+    fq2 = fq.format("2")
+    if read == 1:
+        return [fq1]
+    elif read == 2:
+        return [fq2]
+    elif read == 12:
+        return [fq1, fq2]
+
+#===== rule all =====
+
+rule all:
+    input:
+        #expand("{dir}/fastqc_{individual_id}", zip, dir = [sequence_mt["path"].loc[individual_id] for individual_id in SAMPLES], individual_id = SAMPLES),
+        #config["data_dir"] + "/multiqc_report_2025.html",
+        #f"{ref_base}.fna.fai",
+        #expand(f"{results_dir}/alignment/{ref_name}/{{individual_id}}.bam", individual_id = SAMPLES),
+        #expand(f"{results_dir}/alignment/{ref_name}/{{individual_id}}.bam.flagstat", individual_id = SAMPLES),
+        #expand(f"{results_dir}/alignment/{ref_name}/CRAMS/{{individual_id}}.cram", individual_id = SAMPLES),
+        expand(f"{results_dir}/alignment/{ref_name}/{{individual_id}}.bam", individual_id = SAMPLES)
+        #f"{results_dir}/alignment/{ref_name}" + "/multiqc_flagstat_2025.html"
+
+
+#===== change names fastq =====
+
+# concatinate any files from different sequencing lanes
+# e.g. cat V350134599_L03_B5GANIwsvhRAGFA-568_1.fq.gz V350136178_L01_B5GANIwsvhRAGFA-568_1.fq.gz > CV61_1.fq.gz
+
+# #===== quality control fastqc =====
+
+rule fastqc: # quality control of fastq files
+    input:
+        fastq = lambda wildcards: get_fq(wildcards.individual_id, 12) 
+    output:
+        qc_dir = directory("{dir}/fastqc_{individual_id}/")
+        #html = "",
+        #zip = ""
+    threads: 2
+    shell:
+        "mkdir -p {output.qc_dir} && " + "fastqc {input.fastq} --threads {threads} --outdir {output.qc_dir}"
+
+rule multiqc: # report of quality control
+    input:
+        html = expand("{dir}/fastqc_{individual_id}/", zip, dir = [sequence_mt["path"].loc[individual_id] for individual_id in SAMPLES], individual_id = SAMPLES)
+    output:
+        #html = "/".join(config["sample_mt"].split("/")[:-1]) + "/multiqc_report.html"
+        html = config["data_dir"] + "/multiqc_report_2025.html"
+    shell:
+        "multiqc {{input.html}} -f -o {out}".format(out = config["data_dir"])
+        #.format(out = "/".join(config["sample_mt"].split("/")[:-1])) 
+
+#===== index reference genome =====
+
+rule bwa_index: # indexing reference genome
+    input:
+        ref = ref_base + ref_ext
+    output:
+        amb = f"{ref_base}.fna.amb",
+        ann = f"{ref_base}.fna.ann",
+        bwt = f"{ref_base}.fna.bwt",
+        pac = f"{ref_base}.fna.pac",
+        sa = f"{ref_base}.fna.sa",
+        fai = f"{ref_base}.fna.fai",
+        dict = f"{ref_base}.dict"
+    resources:
+        walltime = 3
+    params:
+        ref_base = ref_base,
+        ref_fna = ref_fna
+    shell:
+        """
+        gunzip -k {input.ref}
+        bwa index {params.ref_fna}
+        samtools dict \
+            -a {params.ref_base} \
+            {input.ref} \
+            -o {output.dict}
+        samtools faidx {params.ref_fna}
+        """
+
+#===== align reads =====
+
+rule align_reads: # aligning reads to reference genome + sorting + marking duplicates + indexing
+    input:
+        forward_reads = lambda wildcards: get_fq(wildcards.individual_id, 1), #get_forward_read,
+        reverse_reads = lambda wildcards: get_fq(wildcards.individual_id, 2), #get_reverse_read,
+        ref = f"{ref_base}.fna"
+    output:
+        bam = f"{results_dir}/alignment/{ref_name}/{{individual_id}}.bam"
+    threads: 3 #7
+    resources:
+        mem_mb=28000,#lambda wildcards, threads: threads*2,
+        walltime = 72
+    params:
+        sample_id = SAMPLES,
+        add_threads = lambda wildcards, threads: threads-1,
+        output_bam_prefix = f"{results_dir}/alignment/{ref_name}/{{individual_id}}",
+        #ext = lambda wildcards: sample_mt.loc[wildcards['sequence_id'],'calcua_read_location'].rsplit('.',1)[-1],
+    shell:
+         """
+         bwa mem -t {threads} {input.ref} {input.forward_reads} {input.reverse_reads} \
+         | samtools fixmate --threads {params.add_threads} -m - - \
+         | samtools sort -o {params.output_bam_prefix}.tmp --threads {params.add_threads}
+         samtools markdup {params.output_bam_prefix}.tmp {params.output_bam_prefix}.bam --threads {{params.add_threads}}
+         samtools index {output.bam}
+         rm {params.output_bam_prefix}.tmp
+         """
+
+# #===== QC alignment =====    
+
+rule flagstat: # result of alignment
+    input:
+         bam = f"{results_dir}/alignment/{ref_name}/{{individual_id}}.bam"
+    output:
+        flagstat = f"{results_dir}/alignment/{ref_name}/{{individual_id}}.bam.flagstat"
+    threads: 1
+    resources:
+        mem_mb=1000,
+        walltime=1
+    shell:
+        'samtools flagstat {input.bam} > {output.flagstat}'
+
+# rule multiqc_flagstat: # report of alignment results (quality control)
+    input:
+        tsv = expand(f"{results_dir}/alignment/{ref_name}/{{individual_id}}.bam.flagstat", individual_id = SAMPLES)
+    output:
+        html = f"{results_dir}/alignment/{ref_name}" + "/multiqc_flagstat_2025.html"
+    shell:
+        "multiqc --force --filename multiqc_flagstat_2025.html --outdir {results_dir}/alignment/{ref_name}/ {results_dir}/alignment/{ref_name}/" 
+
+# rule deeptools: 
+    input:
+        bam = f"{results_dir}/alignment/{ref_name}/{{individual_id}}.bam"
+    output:
+        bedgraph = f"{results_dir}/alignment/{ref_name}/deeptools/{{individual_id}}.bg"
+    threads: 8
+    conda: "dtenv"
+    shell:
+        "bamCoverage --bam {input.bam} --binSize 100000 --numberOfProcessors {threads} --outFileFormat bedgraph --outFileName {output.bedgraph}"
+
+# rule plot_bg_coverage: 
+    input:
+        bedgraph = f"{results_dir}/alignment/{ref_name}/deeptools/{{individual_id}}.bg"
+    output:
+        pdf = f"{results_dir}/alignment/{ref_name}/deeptools/{{individual_id}}.filtered_deeptools.pdf"
+    params:
+        script = config["scripts"]["plot_bg_coverage"],
+        tag = config["ref"]["chrom_tag"],
+        readlength = 150
+    conda: "dtenv"
+    shell:
+         "Rscript {params.script} {input.bedgraph} {params.tag} {params.readlength} {output.pdf}"   
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
