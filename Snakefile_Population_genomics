@@ -366,3 +366,6 @@ rule run_admixture: # try with bootstrap 50 times instead of 200
 
 #vcftools --gzvcf /scratch/antwerpen/grp/asvardal/projects/psiculus/results/variant_calling/rPodSic1.hap1.1/no_if1.sf_stringent1/psiculus_inbreeding.no_if1.sf_stringent1.pass.snps.biallelic.autosomes.vcf.gz --weir-fst-pop /scratch/antwerpen/grp/asvardal/projects/psiculus/metadata/samples_Fst_islandLA.txt --weir-fst-pop /scratch/antwerpen/grp/asvardal/projects/psiculus/metadata/samples_Fst_islandPJ.txt --fst-window-size 50000 --fst-window-step 10000 --out psiculus_inbreeding_PJLA_50kb_Fst
 
+#===== Dsuite =====
+
+#Dsuite Dtrios -c -n psiculus_inbreeding -o /scratch/antwerpen/grp/asvardal/projects/psiculus/results/population_analyses/rPodSic1.hap1.1/Dsuite/inbreeding/ /scratch/antwerpen/grp/asvardal/projects/psiculus/results/variant_calling/rPodSic1.hap1.1/all/no_if1.sf_stringent1/psiculus_inbreeding_outgroups.no_if1.sf_stringent1.pass.snps.biallelic.autosomes.vcf.gz /scratch/antwerpen/grp/asvardal/projects/psiculus/metadata/Dsuite_species_sets.txt
