@@ -1,0 +1,368 @@
+shell.prefix("source /data/antwerpen/grp/asvardal/share/hscon5_setup.sh; ")
+
+#=======================================
+##### Population analyses Pipeline #####
+#======================================
+
+# import libraries
+
+import subprocess
+from scipy import stats
+import pandas as pd
+import os, yaml
+os.environ['OPENBLAS_NUM_THREADS'] = '1'
+import numpy as np
+import pysam
+from matplotlib import pyplot as plt
+jn = os.path.join
+
+TEST = False 
+N_TEST_CHUNKS = 2
+START = int(1e6)
+END = int(1e6 + 1e5)
+
+# config file
+
+configfile: "config.yaml"
+data_dir = config['data_dir'] # data directory
+results_dir = config['results_dir']  #results directory
+mt_dir = config['mt_dir']
+ref_name = config['ref']['name']
+ref_base = config['ref']['base_fn']
+ref_ext = config['ref']['ext_fa']
+ref_fai = config['ref']['base_fn'] + '.fna.fai'
+ref_fna = config['ref']['base_fn'] + '.fna'
+ref_indexes = ['.amb', '.ann', '.bwt', '.pac','.sa','.fai']
+callset_id = config['callset_id']
+
+# wildcard constraints
+
+wildcard_constraints:
+    i = r"\d+",
+    contig = r"\d+",
+    chrom = r"\w+\.1",
+    ref_fn = r".*\.fa",
+    ind_filter_id = r"[^.]+",
+    site_filter_id = r"[^.]+",
+    family_id = r"\w+",
+    filter_id = r"[^.]+",
+    chunk = r"\d+",
+    vcf_type = r"(pass\.snps\.biallelic|pass\.indels\.biallelic|variants)",
+    vcf_extension = r"(vcf|vcf\.gz|bcf)",
+    regenotype = r"(whatshap_regenotype|no_regenotype)",
+    alignment_file = r".*(sam|cram|bam)",
+    K = r"\d+",
+    window = r"\w+\.1+"
+
+# vcf file
+vcf_file = config['vcf'] # note: autosomes .vcf, no W and Z chromosomes
+vcf_outgroup = config['vcf_outgroup'] # note: autosomes .vcf, no W and Z chromosomes; outgroup = PMU01
+
+# metadata
+
+sequence_mt = pd.read_csv(config["sample_mt"], dtype=str, sep='\t').fillna('').set_index("individual_id", drop=False) 
+# reads metadata file specified in config, sets index as individual_id
+
+SAMPLES = sequence_mt.index.values
+
+# Get chromosome names and lengths from reference FASTA index file
+chromosome_lengths = {}
+with open(ref_fai, 'r') as f:
+    for line in f:
+        if line.startswith('OZ'): #NC
+            fields = line.split('\t')
+            chromosome_lengths[fields[0]] = int(fields[1])
+
+# Extract list of chromosome names from the dictionary
+chromosomes = list(chromosome_lengths.keys())
+ 
+# Configuration for phylogenetic analysis using non-overlapping genome windows.
+# The generate_windows function creates a list of adjacent, non-overlapping genome windows for each chromosome
+# based on their lengths and the defined window size.
+WINDOW_SIZE = config['window_size']
+ 
+def generate_windows(chromosome_lengths, window_size):
+    windows = []
+    for chromosome, length in chromosome_lengths.items():
+        num_windows = length // window_size
+        chr_windows = [f"{chromosome}:{i*window_size+1}-{(i+1)*window_size}" for i in range(num_windows)]
+        windows.extend(chr_windows)
+    return windows
+ 
+# Generate the list of windows based on the lengths of the chromosomes and the defined window size.
+windows = generate_windows(chromosome_lengths, WINDOW_SIZE)
+# windows_list = "\t".join(windows)
+# windows_list2 = windows_list.index.values 
+ 
+# Convert window size to KB
+window_size_kb = config['window_size'] // 1000
+
+# Admixture K's
+
+K_all = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14] 
+subset_samples = config['subset_samples']
+
+def get_bams(individual_id):
+    return f"{results_dir}/alignment/{ref_name}/{individual_id}.bam"
+
+# chromosomes 
+
+# chromosome names
+
+chrom_names = pd.read_csv(config["chrom_names"], dtype=str, sep='\t', index_col=0).fillna('')
+chrom_names_nucl = pd.read_csv(config["chrom_names_nucl"], dtype=str, sep='\t', index_col=0).fillna('')
+
+# define chromosomes 
+
+CHROMOSOMES = chrom_names.index.values 
+CHROMOSOMES_auto = chrom_names_nucl.index.values
+
+
+WINDOW_CONFIGS = ["1500_50"]
+
+
+#===== rule all =====
+
+rule all:
+    input:
+        f"{results_dir}/population_analyses/rPodSic1.hap1.1/PCA/{callset_id}_all.prune.in",
+        f"{results_dir}/population_analyses/rPodSic1.hap1.1/PCA/{callset_id}_all.prune.out",
+        f"{results_dir}/population_analyses/rPodSic1.hap1.1/PCA/{callset_id}_all.eigenvec",
+        f"{results_dir}/population_analyses/rPodSic1.hap1.1/PCA/{callset_id}_all.eigenval",
+        f"{results_dir}/population_analyses/rPodSic1.hap1.1/PCA/{callset_id}_island.prune.in",
+        f"{results_dir}/population_analyses/rPodSic1.hap1.1/PCA/{callset_id}_island.prune.out",
+        f"{results_dir}/population_analyses/rPodSic1.hap1.1/PCA/{callset_id}_island.eigenvec",
+        f"{results_dir}/population_analyses/rPodSic1.hap1.1/PCA/{callset_id}_island.eigenval"
+        expand(f"{results_dir}/population_analyses/rPodSic1.hap1.1/genetic_diversity/rohan_v2/{{individual_id}}.summary.txt", individual_id = SAMPLES),
+        f"{results_dir}/population_analyses/rPodSic1.hap1.1/tree/{window_size_kb}KB/{callset_id}_{{window}}.treefile",
+        expand(f"{results_dir}/population_analyses/rPodSic1.hap1.1/tree/{window_size_kb}KB/{callset_id}_{{window}}.treefile", window = windows),
+        f"{results_dir}/population_analyses/rPodSic1.hap1.1/admixture/{callset_id}_admixture.bed",
+        expand(f"{results_dir}/population_analyses/rPodSic1.hap1.1/admixture/{callset_id}_admixture2.{{K}}.Q", K = K_all)
+
+        
+#===== pca =====
+
+rule plink2_indep: # linkage pruning
+    input:
+        vcf_all = vcf_file,
+    output:
+        prune_in_all = f"{results_dir}/population_analyses/rPodSic1.hap1.1/PCA/{callset_id}_all.prune.in",
+        prune_out_all = f"{results_dir}/population_analyses/rPodSic1.hap1.1/PCA/{callset_id}_all.prune.out",
+    threads: 4
+    params:
+        prefix_all = f"{results_dir}/population_analyses/rPodSic1.hap1.1/PCA/{callset_id}_all",
+    shell:
+        """
+        plink2 --vcf {input.vcf_all} --threads {threads} --memory 16000 --double-id --allow-extra-chr --set-missing-var-ids @:# --maf 0.01 --indep-pairwise 50 10 0.2 --out {params.prefix_all}
+        """
+
+rule plink2_pca: # make pca plot using plink
+    input:
+        vcf_all = vcf_file,
+        prune_in_all = f"{results_dir}/population_analyses/rPodSic1.hap1.1/PCA/{callset_id}_all.prune.in",
+    output:
+        eigenvec_all = f"{results_dir}/population_analyses/rPodSic1.hap1.1/PCA/{callset_id}_all.eigenvec",
+        eigenval_all = f"{results_dir}/population_analyses/rPodSic1.hap1.1/PCA/{callset_id}_all.eigenval",
+    threads: 4
+    params:
+        prefix_all = f"{results_dir}/population_analyses/rPodSic1.hap1.1/PCA/{callset_id}_all",
+    shell:
+        """
+        plink2 --vcf {input.vcf_all} --threads {threads} --memory 16000 --double-id --allow-extra-chr --set-missing-var-ids @:# --extract {input.prune_in_all} --pca --make-bed --out {params.prefix_all} 
+        """
+
+rule plink2_indep_isl: # linkage pruning (island only)
+    input:
+        vcf_all = vcf_file,
+    output:
+        prune_in_all = f"{results_dir}/population_analyses/rPodSic1.hap1.1/PCA/{callset_id}_island.prune.in",
+        prune_out_all = f"{results_dir}/population_analyses/rPodSic1.hap1.1/PCA/{callset_id}_island.prune.out",
+    threads: 4
+    params:
+        prefix_island = f"{results_dir}/population_analyses/rPodSic1.hap1.1/PCA/{callset_id}_island",
+        keep_file = f"{mt_dir}/samples_island2025.txt"
+    shell:
+        """
+        plink2 --vcf {input.vcf_all} --threads {threads} --memory 16000 \
+               --double-id --allow-extra-chr --set-missing-var-ids @:# --maf 0.01 \
+               --keep {params.keep_file} \
+               --indep-pairwise 50 10 0.2 \
+               --out {params.prefix_island}
+        """
+
+rule plink2_pca_isl: # PCA (island only)
+    input:
+        vcf_all = vcf_file,
+        prune_in_all = f"{results_dir}/population_analyses/rPodSic1.hap1.1/PCA/{callset_id}_island.prune.in",
+    output:
+        eigenvec_all = f"{results_dir}/population_analyses/rPodSic1.hap1.1/PCA/{callset_id}_island.eigenvec",
+        eigenval_all = f"{results_dir}/population_analyses/rPodSic1.hap1.1/PCA/{callset_id}_island.eigenval",
+    threads: 4
+    params:
+        prefix_island = f"{results_dir}/population_analyses/rPodSic1.hap1.1/PCA/{callset_id}_island",
+        keep_file = f"{mt_dir}/samples_island2025.txt"
+    shell:
+        """
+        plink2 --vcf {input.vcf_all} --threads {threads} --memory 16000 \
+               --double-id --allow-extra-chr --set-missing-var-ids @:# \
+               --extract {input.prune_in_all} \
+               --keep {params.keep_file} \
+               --pca --make-bed \
+               --out {params.prefix_island}
+        """
+
+#===== bcftools/RoH =====
+
+# bcftools roh -O r -e - -a 0.000624 -H 0.001992 --threads 5 -o bcftools_roh_r_out_v2.txt vcf_file
+    # with -a and -H flag determined from vt_all_per_sample.txt; see jupyter notebook popgen
+
+#===== ANGSD =====
+
+rule run_angsd: 
+    input:
+        bam = lambda wildcards: get_bams(wildcards.individual_id), 
+        fna = f"{ref_base}.fna",
+    output:
+        idx = f"{results_dir}/population_analyses/rPodSic1.hap1.1/genetic_diversity/angsd/{{individual_id}}.saf.idx",
+        gz = f"{results_dir}/population_analyses/rPodSic1.hap1.1/genetic_diversity/angsd/{{individual_id}}.saf.pos.gz"
+    threads: 4
+    resources:
+         mem_mb=10000,
+         walltime=72
+    params:
+        prefix = f"{results_dir}/population_analyses/rPodSic1.hap1.1/genetic_diversity/angsd/{{individual_id}}",
+        dir = f"{results_dir}/population_analyses/rPodSic1.hap1.1/genetic_diversity/angsd",
+        rf = config["angsd"]
+    shell:
+        """
+        module load angsd
+        mkdir -p {params.dir} && \
+        angsd \
+            -i {input.bam} \
+            -rf {params.rf} \
+            -nThreads {threads} \
+            -ref {input.fna} \
+            -anc {input.fna} \
+            -doSaf 1 \
+            -GL 1 \
+            -C 50 \
+            -fold 1 \
+            -minQ 20 \
+            -minMapQ 30 \
+            -out {params.prefix}
+        """
+
+rule run_realSFS:
+    input:
+        idx = f"{results_dir}/population_analyses/rPodSic1.hap1.1/genetic_diversity/angsd/{{individual_id}}.saf.idx",
+        pos = f"{results_dir}/population_analyses/rPodSic1.hap1.1/genetic_diversity/angsd/{{individual_id}}.saf.pos.gz"
+    output:
+        ml = f"{results_dir}/population_analyses/rPodSic1.hap1.1/genetic_diversity/angsd/{{individual_id}}.est.ml"
+    threads: 3
+    shell:
+        "realSFS {input.idx} -nSites 200000 > {output.ml}"
+
+rule getHetvalues_folded_angsd:
+    input:
+        ml = f"{results_dir}/population_analyses/rPodSic1.hap1.1/genetic_diversity/angsd/{{individual_id}}.est.ml"
+    output:
+        txt = f"{results_dir}/population_analyses/rPodSic1.hap1.1/genetic_diversity/angsd/{{individual_id}}.het.txt"
+    params:
+        script = config["scripts"]["getHetvalues_folded"]
+    shell:
+        "python {params.script} {input.ml} > {output.txt}"
+
+
+#===== window-based tree (iqtree + astral) =====
+    # Creates a windowed tree. Here a tree is created for every 100KB in the genome, this is then put into ASTRAL to create the consensus tree (cf. Henrique)
+
+rule calculate_trees_windows: 
+    input:
+        vcf = vcf_outgroup
+    output:
+        tree = f"{results_dir}/population_analyses/rPodSic1.hap1.1/tree/{window_size_kb}KB_v2/{callset_id}_{{window}}.treefile"
+        #expand(f"{results_dir}/population_analyses/rPodSic1.hap1.1/tree/{window_size_kb}KB/{callset_id}_{{window}}.treefile", window = windows)
+    params:
+        script = config["scripts"]["vcf2phylip"],
+        threads = "AUTO",
+        bootstraps = "1000",
+        model = "GTR",
+        outgroup = 'PMU01', 
+        #window = lambda wildcards: wildcards.window,
+        #prefix = f"{results_dir}/population_analyses/tree/{window_size_kb}KB/{callset_id}_{{window}}"
+    resources:
+        mem_mb=3840,
+        cpus=1,
+        walltime=12
+    wildcard_constraints:
+        window = "|".join(windows)
+    shell: 
+        """
+        bcftools view -r {wildcards.window} {input.vcf} > {wildcards.window}.vcf 
+        python {params.script} -i {wildcards.window}.vcf 
+        iqtree -s {wildcards.window}.min4.phy -nt {params.threads} -B {params.bootstraps} -m {params.model} -o {params.outgroup} --prefix f"{results_dir}/population_analyses/tree/{window_size_kb}KB/{callset_id}_{{window}}" --redo-tree
+        rm {wildcards.window}.vcf {wildcards.window}.min4.phy
+        """          
+# next: in 100KB folder - cat *.treefile > psiculus_inbreeding_full_100KB.tre
+# next: run ASTRAL - java -jar astral.5.7.8.jar -i psiculus_inbreeding_full_100KB.tre --outgroup PMU01 -o psiculus_inbreeding_full_100KB_ASTRAL.tre 2>psiculus_inbreeding_full_100KB_ASTRAL.log
+
+
+#===== admixture =====
+
+rule pruned_bed:
+    input:
+        vcf = vcf_file # on whole vcf
+    output:
+        bed = f"{results_dir}/population_analyses/rPodSic1.hap1.1/admixture/{callset_id}_admixture2.bed"
+    params:
+        prefix = f"{results_dir}/population_analyses/rPodSic1.hap1.1/admixture/{callset_id}_admixture2",
+        threads = 4,
+        #samples = subset_samples
+    shell:
+        """
+        plink2 --vcf {input.vcf} --threads {threads} --memory 16000  --double-id --allow-extra-chr --set-missing-var-ids @:# --maf 0.01 --indep-pairwise 50 10 0.2 --out {params.prefix}_pruned &&
+        plink2 --vcf {input.vcf} --extract {params.prefix}_pruned.prune.in --double-id --allow-extra-chr --set-missing-var-ids @:# --make-bed --out {params.prefix}_admixture
+        """
+        # --keep {params.samples} in case of subset, in both plink2 commands
+# ADMIXTURE does not accept chromosome names that are not human chromosomes. We will thus just exchange the first column by 0
+    #awk '{$1="0";print $0}' $FILE.bim > $FILE.bim.tmp
+    #mv $FILE.bim.tmp $FILE.bim
+
+rule run_admixture: # try with bootstrap 50 times instead of 200
+    input:
+        bed = f"{results_dir}/population_analyses/rPodSic1.hap1.1/admixture/{callset_id}_admixture2.bed"
+    output:
+        admixture = f"{results_dir}/population_analyses/rPodSic1.hap1.1/admixture/{callset_id}_admixture2.{{K}}.Q"
+    params:
+        K_values = lambda wildcards: wildcards.K,
+        workdir = f"{results_dir}/population_analyses/rPodSic1.hap1.1/admixture"
+    threads: 28
+    resources:
+        mem_mb = 100000,
+        walltime = 168
+    shell:
+        """
+        cd {params.workdir}
+        admixture --cv -j{threads} -B50 {input.bed} {params.K_values} > log_admixture2.{params.K_values}.out 
+        """
+        
+# For plotting:
+    #awk '/CV/ {print $3,$4}' log_admixture2.**.out | sed 's/://' | awk '{print $1, $2}' > psiculus_inbreeding_admixture2.cv.error
+    #plink --bfile psiculus_inbreeding_admixture2 --recode --out  psiculus_inbreeding_admixture2
+    #awk '{print $1,$2,$3,$4}' psiculus_inbreeding_admixture2.ped > psiculus_inbreeding_admixture2_columns.ped
+
+
+#===== Fst =====
+
+#vcftools --gzvcf /scratch/antwerpen/grp/asvardal/projects/psiculus/results/variant_calling/rPodSic1.hap1.1/no_if1.sf_stringent1/psiculus_inbreeding.no_if1.sf_stringent1.pass.snps.biallelic.autosomes.vcf.gz --weir-fst-pop /scratch/antwerpen/grp/asvardal/projects/psiculus/metadata/samples_Fst_mainland.txt --weir-fst-pop /scratch/antwerpen/grp/asvardal/projects/psiculus/metadata/samples_Fst_island.txt --fst-window-size 50000 --fst-window-step 10000 --out psiculus_inbreeding_mainland_island_50kb_Fst
+
+#vcftools --gzvcf /scratch/antwerpen/grp/asvardal/projects/psiculus/results/variant_calling/rPodSic1.hap1.1/no_if1.sf_stringent1/psiculus_inbreeding.no_if1.sf_stringent1.pass.snps.biallelic.autosomes.vcf.gz --weir-fst-pop /scratch/antwerpen/grp/asvardal/projects/psiculus/metadata/samples_Fst_mainlandIT.txt --weir-fst-pop /scratch/antwerpen/grp/asvardal/projects/psiculus/metadata/samples_Fst_mainlandHR.txt --weir-fst-pop /scratch/antwerpen/grp/asvardal/projects/psiculus/metadata/samples_Fst_islandLA.txt --weir-fst-pop /scratch/antwerpen/grp/asvardal/projects/psiculus/metadata/samples_Fst_islandMP.txt --weir-fst-pop /scratch/antwerpen/grp/asvardal/projects/psiculus/metadata/samples_Fst_islandPJ.txt --fst-window-size 50000 --fst-window-step 10000 --out psiculus_inbreeding_clusters_50kb_Fst
+
+#vcftools --gzvcf /scratch/antwerpen/grp/asvardal/projects/psiculus/results/variant_calling/rPodSic1.hap1.1/no_if1.sf_stringent1/psiculus_inbreeding.no_if1.sf_stringent1.pass.snps.biallelic.autosomes.vcf.gz --weir-fst-pop /scratch/antwerpen/grp/asvardal/projects/psiculus/metadata/samples_Fst_mainlandIT.txt --weir-fst-pop /scratch/antwerpen/grp/asvardal/projects/psiculus/metadata/samples_Fst_mainlandHR.txt --fst-window-size 50000 --fst-window-step 10000 --out psiculus_inbreeding_mainlandITHR_50kb_Fst
+
+#vcftools --gzvcf /scratch/antwerpen/grp/asvardal/projects/psiculus/results/variant_calling/rPodSic1.hap1.1/no_if1.sf_stringent1/psiculus_inbreeding.no_if1.sf_stringent1.pass.snps.biallelic.autosomes.vcf.gz --weir-fst-pop /scratch/antwerpen/grp/asvardal/projects/psiculus/metadata/samples_Fst_islandMP.txt --weir-fst-pop /scratch/antwerpen/grp/asvardal/projects/psiculus/metadata/samples_Fst_islandPJ.txt --fst-window-size 50000 --fst-window-step 10000 --out psiculus_inbreeding_MPPJ_50kb_Fst
+
+#vcftools --gzvcf /scratch/antwerpen/grp/asvardal/projects/psiculus/results/variant_calling/rPodSic1.hap1.1/no_if1.sf_stringent1/psiculus_inbreeding.no_if1.sf_stringent1.pass.snps.biallelic.autosomes.vcf.gz --weir-fst-pop /scratch/antwerpen/grp/asvardal/projects/psiculus/metadata/samples_Fst_islandLA.txt --weir-fst-pop /scratch/antwerpen/grp/asvardal/projects/psiculus/metadata/samples_Fst_islandMP.txt --fst-window-size 50000 --fst-window-step 10000 --out psiculus_inbreeding_MPLA_50kb_Fst
+
+#vcftools --gzvcf /scratch/antwerpen/grp/asvardal/projects/psiculus/results/variant_calling/rPodSic1.hap1.1/no_if1.sf_stringent1/psiculus_inbreeding.no_if1.sf_stringent1.pass.snps.biallelic.autosomes.vcf.gz --weir-fst-pop /scratch/antwerpen/grp/asvardal/projects/psiculus/metadata/samples_Fst_islandLA.txt --weir-fst-pop /scratch/antwerpen/grp/asvardal/projects/psiculus/metadata/samples_Fst_islandPJ.txt --fst-window-size 50000 --fst-window-step 10000 --out psiculus_inbreeding_PJLA_50kb_Fst
+
