@@ -1,1 +1,1 @@
-Scripts for sequence alignment, variant calling, filtering, population genomics, genetic load, and inbreeding depression analyses of manuscript on demographic history and genetic load of mainland and island Podarcis siculus.
+Scripts for sequence alignment, variant calling, filtering, population genomics, genetic load, and inbreeding depression analyses and plots of manuscript on demographic history and genetic load of mainland and island Podarcis siculus.
