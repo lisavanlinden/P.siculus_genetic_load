@@ -1,0 +1,676 @@
+#shell.prefix("source /data/antwerpen/grp/asvardal/share/hscon5_setup.sh; ")
+# run this in bash before running pipeline: source /scratch/antwerpen/grp/asvardal/software/container_activate_hscon7
+
+#=============================
+##### Population analyses Pipeline #####
+#=============================
+
+# import libraries
+
+import subprocess
+from scipy import stats
+import pandas as pd
+import os, yaml
+os.environ['OPENBLAS_NUM_THREADS'] = '1'
+import numpy as np
+import pysam
+from matplotlib import pyplot as plt
+jn = os.path.join
+
+TEST = False 
+N_TEST_CHUNKS = 2
+START = int(1e6)
+END = int(1e6 + 1e5)
+
+# config file
+
+configfile: "config.yaml"
+data_dir = config['data_dir'] # data directory
+results_dir = config['results_dir']  #results directory
+mt_dir = config['mt_dir']
+ref_name = config['ref']['name']
+ref_base = config['ref']['base_fn']
+ref_ext = config['ref']['ext_fa']
+ref_fai = config['ref']['base_fn'] + '.fna.fai'
+ref_fna = config['ref']['base_fn'] + '.fna'
+ref_indexes = ['.amb', '.ann', '.bwt', '.pac','.sa','.fai']
+callset_id = config['callset_id']
+
+# wildcard constraints
+
+# wildcard_constraints: #this is important, because otherwise the wildcards in the rules are ambiguous
+#     i="\d+",
+#     contig="\d+",
+#     chrom="\w+\.1", #"\w+", #chrom="(\w+|all_chrom)"
+#     ref_fn=".*.fa",
+#     #sequence_id="\w+",
+#     ind_filter_id="[^.]+",
+#     site_filter_id="[^.]+",
+#     family_id="\w+",
+#     filter_id="[^.]+",#"^/(?!raw|all_sites)([^.]+)$"
+#     chunk="\d+",
+#     vcf_type="(pass\.snps\.biallelic|pass\.indels\.biallelic|variants)",
+#     vcf_extension="(vcf|vcf\.gz|bcf)",
+#     regenotype="(whatshap_regenotype|no_regenotype)",
+#     alignment_file=".*(sam|cram|bam)",
+#     K="\d+",
+#     window ="\w+\.1+" #"[^.]+"
+wildcard_constraints:
+    i = r"\d+",
+    contig = r"\d+",
+    chrom = r"\w+\.1",
+    ref_fn = r".*\.fa",
+    ind_filter_id = r"[^.]+",
+    site_filter_id = r"[^.]+",
+    family_id = r"\w+",
+    filter_id = r"[^.]+",
+    chunk = r"\d+",
+    vcf_type = r"(pass\.snps\.biallelic|pass\.indels\.biallelic|variants)",
+    vcf_extension = r"(vcf|vcf\.gz|bcf)",
+    regenotype = r"(whatshap_regenotype|no_regenotype)",
+    alignment_file = r".*(sam|cram|bam)",
+    K = r"\d+",
+    window = r"\w+\.1+"
+
+# vcf file
+vcf_file = config['vcf'] # note: autosomes .vcf, no W and Z chromosomes
+vcf_outgroup = config['vcf_outgroup'] # note: autosomes .vcf, no W and Z chromosomes; outgroup = PMU01
+
+# metadata
+
+sequence_mt = pd.read_csv(config["sample_mt"], dtype=str, sep='\t').fillna('').set_index("individual_id", drop=False) # reads metadata file specified in config, sets index as individual_id
+
+SAMPLES = sequence_mt.index.values
+
+# Get chromosome names and lengths from reference FASTA index file
+chromosome_lengths = {}
+with open(ref_fai, 'r') as f:
+    for line in f:
+        if line.startswith('OZ'): #NC
+            fields = line.split('\t')
+            chromosome_lengths[fields[0]] = int(fields[1])
+
+# Extract list of chromosome names from the dictionary
+chromosomes = list(chromosome_lengths.keys())
+ 
+# Configuration for phylogenetic analysis using non-overlapping genome windows.
+# The generate_windows function creates a list of adjacent, non-overlapping genome windows for each chromosome
+# based on their lengths and the defined window size.
+WINDOW_SIZE = config['window_size']
+ 
+def generate_windows(chromosome_lengths, window_size):
+    windows = []
+    for chromosome, length in chromosome_lengths.items():
+        num_windows = length // window_size
+        chr_windows = [f"{chromosome}:{i*window_size+1}-{(i+1)*window_size}" for i in range(num_windows)]
+        windows.extend(chr_windows)
+    return windows
+ 
+# Generate the list of windows based on the lengths of the chromosomes and the defined window size.
+windows = generate_windows(chromosome_lengths, WINDOW_SIZE)
+# windows_list = "\t".join(windows)
+# windows_list2 = windows_list.index.values 
+ 
+# Convert window size to KB
+window_size_kb = config['window_size'] // 1000
+
+# Admixture K's
+
+K_all = [10, 11, 12, 13, 14] #1, 2, 3, 4, 5, 6, 7, 8, 9
+subset_samples = config['subset_samples']
+
+# for ROHan
+
+def get_bams(individual_id):
+    return f"{results_dir}/alignment/{ref_name}/{individual_id}.bam"
+
+# chromosomes 
+
+# chromosome names
+
+chrom_names = pd.read_csv(config["chrom_names"], dtype=str, sep='\t', index_col=0).fillna('')
+chrom_names_nucl = pd.read_csv(config["chrom_names_nucl"], dtype=str, sep='\t', index_col=0).fillna('')
+
+# define chromosomes 
+
+CHROMOSOMES = chrom_names.index.values 
+CHROMOSOMES_auto = chrom_names_nucl.index.values
+WINDOW_CONFIGS = ["1500_50"]
+
+
+#===== rule all =====
+
+rule all:
+    input:
+        expand(f"{results_dir}/population_analyses/rPodSic1.hap1.1/roh_gwas/bf/genotypes_bf/gt_{{chrom}}.raw", chrom = CHROMOSOMES_auto),
+        expand(f"{results_dir}/population_analyses/rPodSic1.hap1.1/roh_gwas/bf/roh_bf/roh_{{chrom}}.raw", chrom = CHROMOSOMES_auto),
+        f"{results_dir}/population_analyses/rPodSic1.hap1.1/roh_gwas/bf/froh_bf/froh_per_chrom.tsv",
+        expand(f"{results_dir}/population_analyses/rPodSic1.hap1.1/roh_gwas/bf/froh_bf/froh_nochrom_{{chrom}}.raw", chrom = CHROMOSOMES_auto),
+        expand(f"{results_dir}/population_analyses/rPodSic1.hap1.1/roh_gwas/bf/"f"roh_gwas_input_windows/{{config}}/"f"gwas_input_windows_covariates_{{chrom}}_{{config}}.tsv",chrom=CHROMOSOMES_auto,config=WINDOW_CONFIGS),
+        expand(f"{results_dir}/population_analyses/rPodSic1.hap1.1/roh_gwas/bf/gwas_roh/roh_gwas_results_windows/{winconf}/roh_gwas_windows_ALL_{chrom}_{winconf}.tsv",chrom=CHROMOSOMES_auto,winconf=WINDOW_CONFIGS),
+        expand(f"{results_dir}/population_analyses/rPodSic1.hap1.1/genetic_diversity/bcftools_roh/ind_roh_windows/rohs/roh_{{chrom}}.raw", chrom = CHROMOSOMES_auto),
+        expand(f"{results_dir}/population_analyses/rPodSic1.hap1.1/genetic_diversity/bcftools_roh/ind_roh_windows/rohs/windows/roh_windows_{{chrom}}.tsv",chrom=CHROMOSOMES_auto),
+
+#===== ROH GWAS BF =====
+# goal 2: create file with per-individual per-snp info on BF, Froh_nochrom, PCs, window ROH_status
+
+GENO_PREFIX = "psiculus_inbreeding_bf"
+ROH_FILE = f"{results_dir}/population_analyses/rPodSic1.hap1.1/roh_gwas/bf/bcftools_roh_r_performance_filtered.txt"
+PHENO_FILE = f"{results_dir}/population_analyses/rPodSic1.hap1.1/roh_gwas/bf/bf_head.txt"
+
+rule plink_recodeA_chr:
+    input:
+        bed = f"{results_dir}/population_analyses/rPodSic1.hap1.1/roh_gwas/bf/{GENO_PREFIX}.bed",
+        bim = f"{results_dir}/population_analyses/rPodSic1.hap1.1/roh_gwas/bf/{GENO_PREFIX}.bim",
+        fam = f"{results_dir}/population_analyses/rPodSic1.hap1.1/roh_gwas/bf/{GENO_PREFIX}.fam"
+    params:
+        bfile_prefix = f"{results_dir}/population_analyses/rPodSic1.hap1.1/roh_gwas/bf/{GENO_PREFIX}",
+        out_prefix = f"{results_dir}/population_analyses/rPodSic1.hap1.1/roh_gwas/bf/genotypes_bf/gt_{{chrom}}"
+    output:
+        raw = f"{results_dir}/population_analyses/rPodSic1.hap1.1/roh_gwas/bf/genotypes_bf/gt_{{chrom}}.raw"
+    shell:
+        """
+        plink --bfile {params.bfile_prefix} \
+              --chr {wildcards.chrom} \
+              --recode A \
+              --allow-extra-chr \
+              --out {params.out_prefix}
+        """
+
+rule roh_matrix2:
+    """
+    Memory-efficient ROH x SNP presence/absence matrix.
+    Writes rows sequentially instead of storing full matrix in RAM.
+    """
+    input:
+        bim = f"{results_dir}/population_analyses/rPodSic1.hap1.1/roh_gwas/bf/{GENO_PREFIX}.bim",
+        roh = ROH_FILE
+    output:
+        roh_raw = f"{results_dir}/population_analyses/rPodSic1.hap1.1/roh_gwas/bf/roh_bf/roh_{{chrom}}.raw"
+    run:
+        import pandas as pd
+        import numpy as np
+
+        chrom = wildcards.chrom
+
+        # --- Load SNPs for the chromosome ---
+        bim = pd.read_csv(input.bim, sep=r"\s+", header=None,
+                          names=["CHR","SNP","GEN_DIST","BP","A1","A2"])
+        bim_chr = bim[bim.CHR == chrom].copy()
+
+        snp_ids = bim_chr["SNP"].tolist()
+        snp_bp = bim_chr["BP"].values   # numpy: fast + compact
+        n_snp = len(snp_bp)
+
+        # --- Load ROHs for the chromosome ---
+        roh = pd.read_csv(input.roh, sep=r"\s+", header=None,
+                          names=["RG","IID","CHR","START","END","LENGTH","NSNP","QUAL"])
+        roh_chr = roh[roh.CHR == chrom].copy()
+
+        # --- List of IIDs ---
+        fam = pd.read_csv(input.bim.replace(".bim", ".fam"), sep=r"\s+", header=None)
+        individuals = fam[1].unique()
+
+        # --- Open output file ---
+        with open(output.roh_raw, "w") as f:
+
+            # header
+            header = ["IID"] + snp_ids
+            f.write("\t".join(header) + "\n")
+
+            # --- Process individual by individual ---
+            for i, iid in enumerate(individuals, 1):
+                df_i = roh_chr[roh_chr.IID == iid]
+
+                # empty vector of zeros
+                row = np.zeros(n_snp, dtype=np.uint8)
+
+                if not df_i.empty:
+                    # merge overlapping ROH intervals (optional, but safer + faster)
+                    intervals = df_i[["START","END"]].sort_values("START").values
+                    merged = []
+                    cur_s, cur_e = intervals[0]
+                    for s, e in intervals[1:]:
+                        if s <= cur_e:
+                            cur_e = max(cur_e, e)
+                        else:
+                            merged.append((cur_s, cur_e))
+                            cur_s, cur_e = s, e
+                    merged.append((cur_s, cur_e))
+
+                    # mark SNPs within merged intervals
+                    for s, e in merged:
+                        mask = (snp_bp >= s) & (snp_bp <= e)
+                        row[mask] = 1
+
+                # write row to file
+                f.write(iid + "\t" + "\t".join(row.astype(str)) + "\n")
+
+                if i % 20 == 0 or i == len(individuals):
+                    print(f"[{i}/{len(individuals)}] {iid} done")
+
+
+rule compute_froh_per_chrom:
+    """
+    Compute Froh per individual per chromosome using the reference FAI file for chromosome lengths.
+    Output columns: IID, CHR, Froh
+    But!!!!!! do this: head -n 2412 froh_per_chrom.tsv > froh_per_chrom_auto.tsv
+    """
+    input:
+        roh = ROH_FILE,                             # bcftools ROH output
+        fai = ref_fai                    # reference genome index
+    output:
+        froh = f"{results_dir}/population_analyses/rPodSic1.hap1.1/roh_gwas/bf/froh_bf/froh_per_chrom.tsv"
+    run:
+        import pandas as pd
+
+        # --- Load ROH file ---
+        roh = pd.read_csv(input.roh, sep=r"\s+", header=None,
+                          names=["RG","IID","CHR","START","END","LENGTH","NSNP","QUAL"])
+
+        # --- Load chromosome lengths from FAI file ---
+        fai = pd.read_csv(input.fai, sep="\t", header=None, usecols=[0,1], names=["CHR","LENGTH"])
+        chrom_lengths = dict(zip(fai["CHR"], fai["LENGTH"]))
+
+        # --- Compute Froh per chromosome ---
+        records = []
+        for (iid, chrom), group in roh.groupby(["IID","CHR"]):
+            roh_length = group["LENGTH"].sum()
+            chrom_len = chrom_lengths.get(chrom)
+            if chrom_len is None:
+                raise ValueError(f"Chromosome {chrom} not found in FAI file")
+            froh = roh_length / chrom_len
+            records.append({"IID": iid, "CHR": chrom, "Froh": froh})
+
+        # Include individuals/chromosomes with no ROH (Froh=0)
+        fam = pd.read_csv(f"{results_dir}/population_analyses/rPodSic1.hap1.1/roh_gwas/bf/{GENO_PREFIX}.fam",
+                          sep=r"\s+", header=None)
+        all_individuals = fam[1].unique()
+        all_chromosomes = fai["CHR"].unique()
+
+        existing_pairs = set((r["IID"], r["CHR"]) for r in records)
+        for iid in all_individuals:
+            for chrom in all_chromosomes:
+                if (iid, chrom) not in existing_pairs:
+                    records.append({"IID": iid, "CHR": chrom, "Froh": 0.0})
+
+        # --- Save Froh table ---
+        froh_df = pd.DataFrame(records)
+        froh_df.to_csv(output.froh, sep="\t", index=False)
+
+
+
+rule froh_nochrom_matrix2:
+    """
+    Memory-efficient Froh_nochrom matrix.
+    Columns: IID + SNPs like in genotypes.raw
+    Value: mean Froh across all other chromosomes
+    """
+    input:
+        bim = f"{results_dir}/population_analyses/rPodSic1.hap1.1/roh_gwas/bf/{GENO_PREFIX}.bim",
+        froh = f"{results_dir}/population_analyses/rPodSic1.hap1.1/roh_gwas/bf/froh_bf/froh_per_chrom_auto.tsv"
+    output:
+        froh_nochrom_raw = f"{results_dir}/population_analyses/rPodSic1.hap1.1/roh_gwas/bf/froh_bf/froh_nochrom_{{chrom}}.raw"
+    run:
+        import pandas as pd
+        import numpy as np
+
+        chrom = wildcards.chrom
+
+        # --- Load SNP IDs for this chromosome ---
+        bim = pd.read_csv(input.bim, sep=r"\s+", header=None,
+                          names=["CHR","SNP","GEN_DIST","BP","A1","A2"])
+        snp_ids = bim[bim["CHR"] == chrom]["SNP"].tolist()
+        n_snp = len(snp_ids)
+
+        # --- Load all Froh values ---
+        froh = pd.read_csv(input.froh, sep="\t")  # IID, CHR, Froh
+
+        # --- Precompute Froh_nochrom for each IID ---
+        individuals = froh["IID"].unique()
+        froh_map = {}
+
+        for iid in individuals:
+            vals = froh[(froh["IID"] == iid) & (froh["CHR"] != chrom)]["Froh"]
+            froh_map[iid] = vals.mean() if not vals.empty else 0.0
+
+        # --- Write output file row by row ---
+        with open(output.froh_nochrom_raw, "w") as f:
+            # header
+            f.write("IID\t" + "\t".join(snp_ids) + "\n")
+
+            for i, iid in enumerate(individuals, 1):
+                val = froh_map[iid]
+                row = [iid] + [f"{val:.6f}"] * n_snp  # replicate float
+                f.write("\t".join(row) + "\n")
+
+                if i % 50 == 0 or i == len(individuals):
+                    print(f"[{i}/{len(individuals)}] {iid} done")
+
+
+rule roh_window_gwas_input_full:
+    """
+    Memory-efficient per-individual per-window ROH GWAS input.
+    """
+    input:
+        roh = f"{results_dir}/population_analyses/rPodSic1.hap1.1/roh_gwas/bf/roh_bf/roh_{{chrom}}.raw",
+        pheno = PHENO_FILE,
+        froh = f"{results_dir}/population_analyses/rPodSic1.hap1.1/roh_gwas/bf/froh_bf/froh_per_chrom_auto.tsv",
+        pcs = f"{results_dir}/population_analyses/rPodSic1.hap1.1/roh_gwas/bf/gwas_roh/GRM_PCs_global_mainland_island.tsv"
+    output:
+        out = (
+            f"{results_dir}/population_analyses/rPodSic1.hap1.1/roh_gwas/bf/"
+            f"roh_gwas_input_windows/{{win}}_{{thr}}/"
+            f"gwas_input_windows_covariates_{{chrom}}_{{win}}_{{thr}}.tsv")
+    params:
+        window_size = lambda wc: int(wc.win),
+        threshold   = lambda wc: int(wc.thr) / 100
+    threads: 1
+    resources:
+        mem_mb=60000,
+        walltime=24,
+        partition="zen2"
+    run:
+        import pandas as pd
+        import numpy as np
+        import os
+
+        W = params.window_size
+        T = params.threshold
+        min_snps = int(0.8 * W)
+
+        os.makedirs(os.path.dirname(output.out), exist_ok=True)
+
+        # ----------------------------
+        # Load small tables only
+        # ----------------------------
+        pheno = pd.read_csv(input.pheno, sep="\t", usecols=["IID", "BF"])
+        froh = pd.read_csv(input.froh, sep="\t", usecols=["IID", "CHR", "Froh"])
+        pcs   = pd.read_csv(input.pcs, sep="\t")
+
+        pheno_map = dict(zip(pheno.IID, pheno.BF))
+        froh_map  = dict(zip(zip(froh.IID, froh.CHR), froh.Froh))
+        pcs_map   = pcs.set_index("IID").to_dict(orient="index")
+
+        # ----------------------------
+        # Open ROH file lazily
+        # ----------------------------
+        roh = pd.read_csv(input.roh, sep="\t")
+
+        snp_cols = roh.columns[1:]
+        snp_chr  = np.array([s.split(":")[0] for s in snp_cols])
+        snp_pos  = np.array([int(s.split(":")[1]) for s in snp_cols])
+
+        # ----------------------------
+        # Precompute windows once
+        # ----------------------------
+        windows = []
+        idx = 0
+        while idx < len(snp_cols):
+            chr_now = snp_chr[idx]
+            start = idx
+            while idx < len(snp_cols) and snp_chr[idx] == chr_now and (idx - start) < W:
+                idx += 1
+            end = idx
+            if end - start >= min_snps:
+                windows.append((
+                    start,
+                    end,
+                    chr_now,
+                    snp_pos[start],
+                    snp_pos[end - 1]
+                ))
+
+        # ----------------------------
+        # Prepare output
+        # ----------------------------
+        header = [
+            "IID","PHENO","PHENO_z",
+            "WINDOW_ID","CHR","WINDOW_START","WINDOW_END",
+            "N_SNP_WINDOW","N_SNP_ROH","ROH_STATUS",
+            "Froh_nochrom"] + list(pcs.columns.drop("IID"))
+
+        fout = open(output.out, "w")
+        fout.write("\t".join(header) + "\n")
+
+        # ----------------------------
+        # Phenotype scaling constants
+        # ----------------------------
+        ph_vals = pheno.BF.dropna().values
+        ph_mean = ph_vals.mean()
+        ph_std  = ph_vals.std(ddof=0)
+
+        # ----------------------------
+        # Iterate per individual (low memory)
+        # ----------------------------
+        for _, row in roh.iterrows():
+            iid = row["IID"]
+            snp_states = row.iloc[1:].to_numpy(dtype=np.int8)
+
+            ph = pheno_map.get(iid, np.nan)
+            ph_z = (ph - ph_mean) / ph_std if pd.notna(ph) else np.nan
+            pc_vals = pcs_map.get(iid, {})
+
+            for s, e, chr_now, p0, p1 in windows:
+                w = snp_states[s:e]
+                n_snps = e - s
+                n_roh = int(w.sum())
+                roh_status = int(n_roh / n_snps >= T)
+                froh_val = froh_map.get((iid, chr_now), np.nan)
+
+                out = [
+                    iid, ph, ph_z,
+                    f"{chr_now}:{p0}-{p1}",
+                    chr_now, p0, p1,
+                    n_snps, n_roh, roh_status,
+                    froh_val] + [pc_vals.get(c, np.nan) for c in pcs.columns if c != "IID"]
+
+                fout.write("\t".join(map(str, out)) + "\n")
+
+        fout.close()
+
+
+
+rule roh_window_gwas_full:
+    """
+    Run window-based ROH-GWAS with group-specific models.
+    """
+    input:
+        df = (
+            f"{results_dir}/population_analyses/rPodSic1.hap1.1/roh_gwas/bf/"
+            "roh_gwas_input_windows/{winconf}/"
+            "gwas_input_windows_covariates_{chrom}_{winconf}.tsv")
+    output:
+        all = (
+            f"{results_dir}/population_analyses/rPodSic1.hap1.1/roh_gwas/bf/"
+            "gwas_roh/roh_gwas_results_windows/{winconf}/"
+            "roh_gwas_windows_ALL_{chrom}_{winconf}.tsv"),
+        ml = (
+            f"{results_dir}/population_analyses/rPodSic1.hap1.1/roh_gwas/bf/"
+            "gwas_roh/roh_gwas_results_windows/{winconf}/"
+            "roh_gwas_windows_MAINLAND_{chrom}_{winconf}.tsv"),
+        il = (
+            f"{results_dir}/population_analyses/rPodSic1.hap1.1/roh_gwas/bf/"
+            "gwas_roh/roh_gwas_results_windows/{winconf}/"
+            "roh_gwas_windows_ISLAND_{chrom}_{winconf}.tsv")
+    run:
+        import pandas as pd
+        import numpy as np
+        import statsmodels.api as sm
+        import os
+
+        # ----------------------------
+        # Parse window configuration
+        # ----------------------------
+        win, thr = wildcards.winconf.split("_")
+
+        MIN_N = 20
+        MIN_ROH = 3
+        MIN_NONROH = 3
+
+        os.makedirs(os.path.dirname(output.all), exist_ok=True)
+
+        df = pd.read_csv(input.df, sep="\t")
+
+        models = {
+            "ALL": {
+                "data": df,
+                "covars": ["ROH_STATUS", "Froh_nochrom", "PC1", "PC2"],
+                "output": output.all
+            },
+            "MAINLAND": {
+                "data": df[df["PC1_ML"].notna()],
+                "covars": ["ROH_STATUS", "Froh_nochrom", "PC1_ML", "PC2_ML", "PC3_ML"],
+                "output": output.ml
+            },
+            "ISLAND": {
+                "data": df[df["PC1_IL"].notna()],
+                "covars": ["ROH_STATUS", "Froh_nochrom", "PC1_IL", "PC2_IL"],
+                "output": output.il
+            }}
+        for group, spec in models.items():
+
+            dfg = spec["data"].dropna(
+                subset=["PHENO_z"] + spec["covars"]
+            )
+
+            results = []
+
+            for window_id, dfw in dfg.groupby("WINDOW_ID"):
+
+                row = {
+                    "WINDOW_ID": window_id,
+                    "CHR": dfw["CHR"].iloc[0],
+                    "N": dfw.shape[0],
+                    "WIN": int(win),
+                    "THR": int(thr),}
+
+                n_roh = (dfw["ROH_STATUS"] == 1).sum()
+                n_nonroh = (dfw["ROH_STATUS"] == 0).sum()
+
+                fail_reason = None
+
+                if dfw.shape[0] < MIN_N:
+                    fail_reason = "low_N"
+                elif dfw["ROH_STATUS"].nunique() < 2:
+                    fail_reason = "no_ROH_variation"
+                elif n_roh < MIN_ROH or n_nonroh < MIN_NONROH:
+                    fail_reason = "low_ROH_counts"
+
+                if fail_reason is not None:
+                    for term in ["const"] + spec["covars"]:
+                        row[f"BETA_{term}"] = np.nan
+                        row[f"SE_{term}"]   = np.nan
+                        row[f"P_{term}"]    = np.nan
+
+                    row["FAIL_REASON"] = fail_reason
+                    row["N_ROH"] = n_roh
+                    row["N_NONROH"] = n_nonroh
+                    results.append(row)
+                    continue
+
+                y = dfw["PHENO_z"]
+                X = sm.add_constant(dfw[spec["covars"]])
+
+                try:
+                    model = sm.OLS(y, X).fit()
+
+                    for term in X.columns:
+                        row[f"BETA_{term}"] = model.params.get(term, np.nan)
+                        row[f"SE_{term}"]   = model.bse.get(term, np.nan)
+                        row[f"P_{term}"]    = model.pvalues.get(term, np.nan)
+
+                    row["FAIL_REASON"] = "OK"
+                    row["N_ROH"] = n_roh
+                    row["N_NONROH"] = n_nonroh
+                    results.append(row)
+
+                except Exception:
+                    for term in X.columns:
+                        row[f"BETA_{term}"] = np.nan
+                        row[f"SE_{term}"]   = np.nan
+                        row[f"P_{term}"]    = np.nan
+
+                    row["FAIL_REASON"] = "model_error"
+                    row["N_ROH"] = n_roh
+                    row["N_NONROH"] = n_nonroh
+                    results.append(row)
+
+            pd.DataFrame(results).to_csv(spec["output"], sep="\t", index=False)
+
+
+
+rule roh_window_matrix_sharing_allind:
+    """
+    Convert SNP-level ROH matrix to window-level ROH presence matrix.
+    Designed for detecting ROH sharing among individuals.
+    """
+    input:
+        roh = f"{results_dir}/population_analyses/rPodSic1.hap1.1/genetic_diversity/bcftools_roh/ind_roh_windows/rohs/roh_{{chrom}}.raw"
+    output:
+        out = f"{results_dir}/population_analyses/rPodSic1.hap1.1/genetic_diversity/bcftools_roh/ind_roh_windows/rohs/windows/roh_windows_{{chrom}}.tsv"
+    params:
+        window_size = 1500,
+        threshold   = 0.5
+    threads: 1
+    run:
+        import pandas as pd
+        import numpy as np
+        import os
+
+        W = params.window_size
+        T = params.threshold
+        min_snps = int(0.8 * W)
+
+        os.makedirs(os.path.dirname(output.out), exist_ok=True)
+
+        # ----------------------------
+        # Load SNP-level ROH matrix
+        # ----------------------------
+        roh = pd.read_csv(input.roh, sep="\t")
+
+        snp_cols = roh.columns[1:]
+        snp_chr  = np.array([s.split(":")[0] for s in snp_cols])
+        snp_pos  = np.array([int(s.split(":")[1]) for s in snp_cols])
+
+        individuals = roh["IID"].values
+
+        # ----------------------------
+        # Define windows
+        # ----------------------------
+        windows = []
+        idx = 0
+        while idx < len(snp_cols):
+            chr_now = snp_chr[idx]
+            start = idx
+
+            while idx < len(snp_cols) and snp_chr[idx] == chr_now and (idx - start) < W:
+                idx += 1
+
+            end = idx
+
+            if end - start >= min_snps:
+                windows.append((start, end, chr_now, snp_pos[start], snp_pos[end-1]))
+
+        # ----------------------------
+        # Write output
+        # ----------------------------
+        with open(output.out, "w") as f:
+
+            header = ["WINDOW_ID"] + list(individuals)
+            f.write("\t".join(header) + "\n")
+
+            for s, e, chr_now, p0, p1 in windows:
+
+                window_id = f"{chr_now}:{p0}-{p1}"
+                row = []
+
+                for _, ind in roh.iterrows():
+                    snp_states = ind.iloc[1:].to_numpy(dtype=np.int8)
+                    w = snp_states[s:e]
+
+                    roh_status = int(w.sum() / len(w) >= T)
+                    row.append(str(roh_status))
+
+                f.write(window_id + "\t" + "\t".join(row) + "\n")
+

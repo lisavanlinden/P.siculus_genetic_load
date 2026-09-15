@@ -1,0 +1,29 @@
+# ============================================================
+# Inbreeding depression analyses commands + scripts
+# ============================================================
+
+# create .bed file
+
+plink2 --vcf /scratch/antwerpen/grp/asvardal/projects/psiculus/results/variant_calling/rPodSic1.hap1.1/no_if1.sf_stringent1/psiculus_inbreeding.no_if1.sf_stringent1.pass.snps.biallelic.autosomes.vcf.gz --keep /scratch/antwerpen/grp/asvardal/projects/psiculus/metadata/samples_performance.txt --allow-extra-chr --make-bed --out psiculus_inbreeding_bf
+
+# run snakemake pipeline roh-gwas
+
+# overlap with podsic genes (Liftoff)
+
+awk 'NR>1{
+split($1,a,":");
+split(a[2],b,"-");
+print a[1]"\t"b[1]"\t"b[2]"\t"$1"\t"$7
+}' roh_neff_significant_windows_IL.tsv > roh_windows_IL.bed
+
+awk 'NR>1{
+split($1,a,":");
+split(a[2],b,"-");
+print a[1]"\t"b[1]"\t"b[2]"\t"$1"\t"$7
+}' roh_neff_significant_windows_ML.tsv > roh_windows_ML.bed
+
+
+awk '$3=="gene" {print $1"\t"$4-1"\t"$5"\t"$9}' /user/antwerpen/206/vsc20666/asvardal_scratch/projects/psiculus/genome/liftoff/PodMur_to_PodSic_liftoff.gff > podsic_genes.bed
+
+bedtools intersect -a roh_windows_IL.bed -b podsic_genes.bed -wa -wb > roh_window_gene_overlap_liftoff_IL.txt
+bedtools intersect -a roh_windows_ML.bed -b podsic_genes.bed -wa -wb > roh_window_gene_overlap_liftoff_ML.txt
