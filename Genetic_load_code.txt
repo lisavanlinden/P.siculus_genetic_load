@@ -1,0 +1,559 @@
+# ============================================================
+# Genetic load analyses commands + scripts
+# ============================================================
+
+# 1. Obtain P. muralis reference genome
+GCF_004329235.1_PodMur_1.0_genomic.fna
+
+# 2. Obtain corresponding P. muralis annotation
+GCF_004329235.1_PodMur_1.0_genomic.gff
+
+# 3. Obtain P. siculus target genome
+GCA_964188175.1_rPodSic1.hap1.1_genomic.fna
+
+# 4. Transfer P. muralis annotations to P. siculus
+liftoff \
+    -g GCF_004329235.1_PodMur_1.0_genomic.gff \
+    -o PodMur_to_PodSic_liftoff.gff \
+    -u unmapped.txt \
+    -m /user/antwerpen/206/vsc20666/my_scratch/minimap2/minimap2 \
+    -p 16 \
+    -copies \
+    -sc 0.95 \
+    GCA_964188175.1_rPodSic1.hap1.1_genomic.fna \
+    GCF_004329235.1_PodMur_1.0_genomic.fna
+
+# 5. Prepare custom SnpEff database
+#    Place transferred GFF and P. siculus FASTA in the
+#    appropriate SnpEff data/PodSic/ directory and configure
+#    the PodSic genome in snpEff.config.
+java -jar snpEff.jar build \
+    -gff3 \
+    -noCheckCds \
+    -noCheckProtein \
+    -v PodSic
+
+# 6. Annotate polarized P. siculus VCF
+java -jar ~/my_scratch/snpEff/snpEff.jar \
+    -v PodSic \
+    -stats snpeff_summary.html \
+    psiculus_inbreeding_polarized.vcf.gz \
+    > psiculus_inbreeding_polarized.ann.vcf
+
+# 7. Remove P. muralis outgroup sample (PMU01)
+bcftools view -s ^PMU01 \
+    psiculus_inbreeding_polarized.ann.vcf \
+    -Oz -o psiculus_inbreeding.ann.vcf.gz
+
+# 8. Extract SnpEff annotations and genotypes
+bcftools query \
+    -f '%INFO/ANN[\t%GT]\n' \
+    psiculus_inbreeding.ann.vcf.gz \
+    > psiculus_inbreeding_ann_gt.txt
+
+# 9. Extract chromosome, position, effect, impact, gene, and genotypes (using the first ANN annotation)
+bcftools query \
+    -f '%CHROM\t%POS\t%INFO/ANN[\t%GT]\n' \
+    psiculus_inbreeding.ann.vcf.gz |
+awk -F'\t' '{
+    split($3,b,",");
+    split(b[1],a,"|");
+    effect=a[2];
+    impact=a[3];
+    gene=a[4];
+    printf "%s\t%s\t%s\t%s\t%s\t%s",$1,$2,$3,effect,impact,gene;
+    for(i=4;i<=NF;i++) printf "\t%s",$i;
+    printf "\n"
+}' > snpeff_ann_effect_impact_gene_genotypes.txt
+
+# 10. Extract sample names
+bcftools query -l psiculus_inbreeding.ann.vcf.gz > samples.txt
+
+# 11. Count synonymous, missense, and loss-of-function variants
+    #     per individual, using SnpEff effect classifications
+    #     and population metadata from popmap.txt.
+    #
+    #     SYN = synonymous_variant
+    #     DEL = missense_variant
+    #     LOF = stop_gained, frameshift_variant, stop_lost, start_lost
+    #
+    #     Heterozygous variants contribute 1 allele;
+    #     homozygous alternate variants contribute 2 alleles.
+    #
+    #     Output: genetic_load_counts.tsv
+
+python3 genetic_load_counts.py
+
+    #!/usr/bin/env python3
+    
+    from collections import defaultdict
+    import pandas as pd
+    
+    # ---- input files ----
+    samples_file = "samples.txt"
+    popmap_file = "popmap.txt"
+    variants_file = "snpeff_ann_effect_impact_gene_genotypes.txt"
+    
+    # ---- load samples ----
+    with open(samples_file) as f:
+        samples = [x.strip() for x in f]
+    
+    # ---- load population metadata ----
+    popmap = {}
+    poptype = {}
+    
+    with open(popmap_file) as f:
+        for line in f:
+            s,p,ptype = line.strip().split()
+            popmap[s] = p
+            poptype[s] = ptype
+    
+    
+    # ---- mutation classes ----
+    SYN = {"synonymous_variant"}
+    DEL = {"missense_variant"}
+    LOF = {"stop_gained","frameshift_variant","stop_lost","start_lost"}
+    
+    tot = defaultdict(int)
+    hom = defaultdict(int)
+    het = defaultdict(int)
+    
+    print("Processing variants...")
+    
+    # ---- parse variant file ----
+    with open(variants_file) as f:
+        for line in f:
+    
+            parts = line.rstrip().split("\t")
+    
+            effect = parts[3]
+            gts = parts[6:]
+    
+            if effect in SYN:
+                cat = "SYN"
+            elif effect in DEL:
+                cat = "DEL"
+            elif effect in LOF:
+                cat = "LOF"
+            else:
+                continue
+    
+            for sample, gt in zip(samples, gts):
+    
+                if gt == "./.":
+                    continue
+    
+                key = (sample, cat)
+    
+                if gt == "0/1" or gt == "1/0":
+                    het[key] += 1
+                    tot[key] += 1
+    
+                elif gt == "1/1":
+                    hom[key] += 1
+                    tot[key] += 2
+    
+    
+    print("Building dataframe...")
+    
+    rows = []
+    categories = ["SYN","DEL","LOF"]
+    
+    for sample in samples:
+        for cat in categories:
+    
+            rows.append({
+                "sample": sample,
+                "population": popmap[sample],
+                "population_type": poptype[sample],
+                "category": cat,
+                "Tot": tot[(sample,cat)],
+                "Hom": hom[(sample,cat)],
+                "Het": het[(sample,cat)]
+            })
+    
+    df_load = pd.DataFrame(rows)
+    
+    df_load = df_load.sort_values(["population","sample","category"])
+    
+    # ---- save results ----
+    df_load.to_csv("genetic_load_counts.tsv", sep="\t", index=False)
+    
+    print("Done.")
+
+
+# 12. Calculate allele frequencies
+
+./calc_AF_pop_parallel.sh
+
+    #!/bin/bash
+    
+    VCF=psiculus_inbreeding.ann.vcf.gz
+    POPMAP=popmap.txt
+    
+    mkdir -p AF_outputs
+    
+    echo "Preparing sample lists..."
+    
+    # create island sample list
+    awk '$3=="island" {print $1}' $POPMAP > AF_outputs/all_island_samples.txt
+    
+    # create mainland sample list
+    awk '$3=="mainland" {print $1}' $POPMAP > AF_outputs/all_mainland_samples.txt
+    
+    
+    echo "Calculating island allele frequencies..."
+    
+    (
+    bcftools view -S AF_outputs/all_island_samples.txt $VCF -Ou \
+    | bcftools +fill-tags -Ou -- -t AF \
+    | bcftools query -f "Island\t%INFO/AF\t%INFO/ANN\n" \
+    > AF_outputs/all_island_AF.tsv
+    ) &
+    
+    
+    echo "Calculating mainland allele frequencies..."
+    
+    (
+    bcftools view -S AF_outputs/all_mainland_samples.txt $VCF -Ou \
+    | bcftools +fill-tags -Ou -- -t AF \
+    | bcftools query -f "Mainland\t%INFO/AF\t%INFO/ANN\n" \
+    > AF_outputs/all_mainland_AF.tsv
+    ) &
+    
+    
+    # wait for both jobs to finish
+    wait
+    
+    
+    echo "Combining outputs..."
+    
+    cat AF_outputs/all_island_AF.tsv AF_outputs/all_mainland_AF.tsv \
+    > AF_outputs/all_mainland_island_AF.tsv
+    
+    
+    echo "Allele frequency calculations finished."
+
+# 13. prepare AF datasets
+
+python3 prepare_AF_datasets.py
+
+    from collections import defaultdict
+    import csv
+    import glob
+    import os
+    from multiprocessing import Pool, cpu_count
+    
+    print("Processing AF files in parallel...")
+    
+    lof_effects = {
+        "stop_gained",
+        "frameshift_variant",
+        "splice_acceptor_variant",
+        "splice_donor_variant"
+    }
+    
+    ns_bins = [0,0.05,0.1,0.2,0.8,1]
+    ns_labels = ["0-5%","5-10%","10-20%","20-80%",">80%"]
+    
+    sfs_bins = [0,0.2,0.4,0.6,0.8,1]
+    sfs_labels = ["0-20%","20-40%","40-60%","60-80%","80-100%"]
+    
+    
+    def find_bin(val, bins, labels):
+        for i in range(len(bins)-1):
+            if bins[i] <= val < bins[i+1]:
+                return labels[i]
+        if val == 1:
+            return labels[-1]
+        return None
+    
+    
+    def process_file(input_file):
+    
+        print(f"Processing {input_file}")
+    
+        ns_counts = defaultdict(int)
+        sfs_counts = defaultdict(int)
+    
+        with open(input_file) as f:
+    
+            reader = csv.reader(f, delimiter="\t")
+    
+            for row in reader:
+    
+                group = row[0]
+                af_str = row[1]
+    
+                try:
+                    af = float(af_str)
+                except ValueError:
+                    continue
+    
+                if af == 0.0 or af == 1.0:
+                    continue
+    
+                ann = row[2]
+                effect = ann.split("|")[1]
+    
+                if effect == "synonymous_variant":
+                    category = "SYN"
+                elif effect == "missense_variant":
+                    category = "DEL"
+                elif effect in lof_effects:
+                    category = "LOF"
+                else:
+                    continue
+    
+                ns_bin = find_bin(af, ns_bins, ns_labels)
+                if ns_bin:
+                    ns_counts[(group,ns_bin,category)] += 1
+    
+                sfs_bin = find_bin(af, sfs_bins, sfs_labels)
+                if sfs_bin:
+                    sfs_counts[(group,sfs_bin,category)] += 1
+    
+    
+        # ----- build NS dataset -----
+    
+        ns_rows = []
+        groups = set(k[0] for k in ns_counts)
+    
+        for g in groups:
+            for b in ns_labels:
+    
+                syn = ns_counts[(g,b,"SYN")]
+                dele = ns_counts[(g,b,"DEL")]
+                lof = ns_counts[(g,b,"LOF")]
+    
+                n = dele + lof
+                ns = n/syn if syn>0 else None
+    
+                ns_rows.append({
+                    "group":g,
+                    "bin":b,
+                    "SYN":syn,
+                    "DEL":dele,
+                    "LOF":lof,
+                    "N":n,
+                    "N_S":ns
+                })
+    
+    
+        # ----- build SFS dataset -----
+    
+        sfs_rows = []
+    
+        for (g,b,c),v in sfs_counts.items():
+    
+            sfs_rows.append({
+                "group":g,
+                "bin":b,
+                "category":c,
+                "count":v
+            })
+    
+    
+        totals = defaultdict(int)
+    
+        for r in sfs_rows:
+            totals[(r["group"],r["category"])] += r["count"]
+    
+        for r in sfs_rows:
+            r["prop"] = r["count"] / totals[(r["group"],r["category"])]
+    
+    
+        # ----- output -----
+    
+        base = os.path.basename(input_file).replace("_AF.tsv","")
+    
+        ns_out = f"AF_outputs/{base}_NS_dataset.tsv"
+        sfs_out = f"AF_outputs/{base}_SFS_dataset.tsv"
+    
+        with open(ns_out,"w") as f:
+    
+            writer = csv.DictWriter(
+                f,
+                fieldnames=["group","bin","SYN","DEL","LOF","N","N_S"],
+                delimiter="\t"
+            )
+    
+            writer.writeheader()
+            writer.writerows(ns_rows)
+    
+        with open(sfs_out,"w") as f:
+    
+            writer = csv.DictWriter(
+                f,
+                fieldnames=["group","bin","category","count","prop"],
+                delimiter="\t"
+            )
+    
+            writer.writeheader()
+            writer.writerows(sfs_rows)
+    
+        print(f"Finished {input_file}")
+    
+    
+    if __name__ == "__main__":
+    
+        files = glob.glob("AF_outputs/*_AF.tsv")
+    
+        n_cores = 5
+    
+        print(f"Running on {n_cores} cores")
+    
+        with Pool(n_cores) as pool:
+            pool.map(process_file, files)
+    
+        print("Done.")
+
+# 14. Calculate load inside and outside ROHs
+
+./roh_variant_load.sh
+
+    #!/bin/bash
+    
+    set -euo pipefail
+    
+    VCF="../psiculus_inbreeding.ann.vcf.gz"
+    ROH_FILE="bcftools_roh_r_out_v2.noheader.txt"
+    POPMAP="../popmap.txt"
+    OUT="roh_load_summary.tsv"
+    NCORES=10
+    
+    # header
+    echo -e "sample\tpopulation\tregion\tlocation\thom_del\thom_syn\thom_lof\thet_del\thet_syn\thet_lof\ttotal_del\ttotal_syn\ttotal_lof" > $OUT
+    
+    echo "Starting parallel analysis with $NCORES cores..."
+    
+    process_sample () {
+    
+        SAMPLE=$1
+        POP=$2
+        REGION=$3
+    
+        TMPDIR=$(mktemp -d "${SAMPLE}.XXXX")
+        trap "rm -rf $TMPDIR" EXIT
+    
+        echo "Processing $SAMPLE"
+    
+        # -----------------------------
+        # 1. ROH BED
+        # -----------------------------
+        awk -v s=$SAMPLE '$1=="RG" && $2==s {print $3"\t"$4-1"\t"$5}' $ROH_FILE > $TMPDIR/roh.bed
+    
+        if [ ! -s $TMPDIR/roh.bed ]; then
+            echo "$SAMPLE: no ROHs"
+            return
+        fi
+    
+        # -----------------------------
+        # 2. Extract variants
+        # -----------------------------
+        bcftools view -s $SAMPLE -Ou $VCF | \
+        bcftools query -f '%CHROM\t%POS\t%INFO/ANN\t[%GT]\n' > $TMPDIR/all.txt
+    
+        if [ ! -s $TMPDIR/all.txt ]; then
+            echo "$SAMPLE: no variants"
+            return
+        fi
+    
+        # -----------------------------
+        # 3. Split hom / het
+        # -----------------------------
+        awk '$4=="1/1"' $TMPDIR/all.txt > $TMPDIR/hom.txt
+        awk '$4=="0/1" || $4=="1/0"' $TMPDIR/all.txt > $TMPDIR/het.txt
+    
+        # -----------------------------
+        # 4. BED
+        # -----------------------------
+        awk '{print $1"\t"$2-1"\t"$2"\t"$3}' $TMPDIR/hom.txt > $TMPDIR/hom.bed
+        awk '{print $1"\t"$2-1"\t"$2"\t"$3}' $TMPDIR/het.txt > $TMPDIR/het.bed
+    
+        # -----------------------------
+        # 5. ROH split
+        # -----------------------------
+        bedtools intersect -a $TMPDIR/hom.bed -b $TMPDIR/roh.bed > $TMPDIR/hom_in.txt
+        bedtools intersect -a $TMPDIR/hom.bed -b $TMPDIR/roh.bed -v > $TMPDIR/hom_out.txt
+    
+        bedtools intersect -a $TMPDIR/het.bed -b $TMPDIR/roh.bed > $TMPDIR/het_in.txt
+        bedtools intersect -a $TMPDIR/het.bed -b $TMPDIR/roh.bed -v > $TMPDIR/het_out.txt
+    
+        # -----------------------------
+        # 6. Count
+        # -----------------------------
+        count_variants () {
+            file=$1
+            awk -F'\t' '
+            {
+                ann=$4
+                split(ann, a, ",")
+                split(a[1], b, "|")
+                impact=b[3]
+    
+                if (impact=="HIGH") lof++
+                else if (impact=="MODERATE") del++
+                else if (impact=="LOW") syn++
+            }
+            END {
+                if (lof=="") lof=0
+                if (del=="") del=0
+                if (syn=="") syn=0
+                print del"\t"syn"\t"lof
+            }' $file
+        }
+    
+        HOM_IN=$(count_variants $TMPDIR/hom_in.txt)
+        HOM_OUT=$(count_variants $TMPDIR/hom_out.txt)
+    
+        HET_IN=$(count_variants $TMPDIR/het_in.txt)
+        HET_OUT=$(count_variants $TMPDIR/het_out.txt)
+    
+        # -----------------------------
+        # 7. Additive totals
+        # -----------------------------
+        calc_total () {
+            echo $1 $2 | awk '{
+                hom_del=$1; hom_syn=$2; hom_lof=$3;
+                het_del=$4; het_syn=$5; het_lof=$6;
+    
+                total_del=het_del + 2*hom_del
+                total_syn=het_syn + 2*hom_syn
+                total_lof=het_lof + 2*hom_lof
+    
+                print total_del"\t"total_syn"\t"total_lof
+            }'
+        }
+    
+        TOTAL_IN=$(calc_total "$HOM_IN" "$HET_IN")
+        TOTAL_OUT=$(calc_total "$HOM_OUT" "$HET_OUT")
+    
+        # -----------------------------
+        # 8. Output
+        # -----------------------------
+        {
+            echo -e "${SAMPLE}\t${POP}\t${REGION}\tin_roh\t${HOM_IN}\t${HET_IN}\t${TOTAL_IN}"
+            echo -e "${SAMPLE}\t${POP}\t${REGION}\tout_roh\t${HOM_OUT}\t${HET_OUT}\t${TOTAL_OUT}"
+        } >> ${OUT}.tmp
+    
+    }
+    
+    export -f process_sample
+    export VCF ROH_FILE OUT
+    
+    : > ${OUT}.tmp
+    
+    # -----------------------------
+    # Run in parallel using popmap
+    # -----------------------------
+    awk '{print $1, $2, $3}' $POPMAP | \
+    xargs -n 3 -P $NCORES bash -c 'process_sample "$@"' _
+    
+    # -----------------------------
+    # Finalize
+    # -----------------------------
+    cat ${OUT}.tmp >> $OUT
+    rm ${OUT}.tmp
+    
+    echo "Done!"
