@@ -6,6 +6,7 @@ library(dplyr)
 library(readxl)
 library(MCMCglmm)
 library(Matrix)
+library(corpcor)
 
 
 # ============================================================
