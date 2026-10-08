@@ -163,6 +163,70 @@ summary(model_BF_Froh)
 
 save_model_summary(model_BF_Froh)
 
+mainland_slope <- model_BF_Froh$Sol[, "Froh"] +
+  model_BF_Froh$Sol[, "Froh:typemainland"]
+
+mean(mainland_slope)
+quantile(mainland_slope, probs = c(0.025, 0.975))
+HPDinterval(as.mcmc(mainland_slope))
+
+2 * min(
+  mean(mainland_slope <= 0),
+  mean(mainland_slope >= 0)
+)
+
+# island only
+
+df_BF_island <- df_BF %>%
+  filter(type == "island")
+
+ids_BF_island <- unique(as.character(df_BF_island$individual_ID))
+grm_inv_BF_island <- grm_inv_BF[ids_BF_island,ids_BF_island]
+dim(grm_inv_BF_island)
+all(ids_BF_island %in% rownames(grm_inv_BF_island))
+ginverse = list(individual_ID = grm_inv_BF_island)
+prior_BF_island <- list(R = list(V = 1, nu = 0.002),G = list(G1 = list(V = 1, nu = 0.002)))
+
+model_BF_island_pop <- MCMCglmm(
+  log_BF_max ~ Froh * population + head_size,
+  random = ~ individual_ID,
+  family = "gaussian",
+  ginverse = list(
+    individual_ID = grm_inv_BF_island),
+  prior = prior_BF_island,
+  data = df_BF_island,
+  nitt = 2000000,
+  burnin = 2000,
+  thin = 200)
+
+summary(model_BF_island_pop)
+
+df_BF_island <- df_BF %>%
+  filter(type == "island") %>%
+  group_by(population) %>%
+  mutate(
+    Froh_pop_mean = mean(Froh, na.rm = TRUE),
+    Froh_within = Froh - Froh_pop_mean
+  ) %>%
+  ungroup()
+
+df_BF_island <- as.data.frame(df_BF_island)
+
+model_BF_island_within <- MCMCglmm(
+  log_BF_max ~ Froh_within + population + head_size,
+  random = ~ individual_ID,
+  family = "gaussian",
+  ginverse = list(
+    individual_ID = grm_inv_BF_island
+  ),
+  prior = prior_BF_island,
+  data = df_BF_island,
+  nitt = 2000000,
+  burnin = 2000,
+  thin = 200
+)
+
+summary(model_BF_island_within)
 
 # ============================================================
 # 5. Sprint speed
